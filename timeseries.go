@@ -10,21 +10,45 @@ import (
 )
 
 type Registry struct {
-	db *gorm.DB
+	db           *gorm.DB
+	aggregateFns map[string]AggregateFn
 }
 
-// NewRegistry creates a new dbTimeSeries instance
+// AggregateFn takes a slice of values in a time bucket and returns a single aggregated value.
+type AggregateFn func(values []float64) float64
+
+const AggregateAVG = "avg"
+
+// NewRegistry creates a new Registry and registers the built-in AVG aggregate.
 func NewRegistry(db *gorm.DB) (*Registry, error) {
 	if err := db.AutoMigrate(&dbTimeSeries{}, &dbSamplingPolicy{}, &dbRecord{}); err != nil {
 		return nil, err
 	}
-	return &Registry{db: db}, nil
+	reg := &Registry{db: db, aggregateFns: make(map[string]AggregateFn)}
+	reg.RegisterAggregateFn(AggregateAVG, func(values []float64) float64 {
+		var sum float64
+		for _, v := range values {
+			sum += v
+		}
+		return sum / float64(len(values))
+	})
+	return reg, nil
 }
 
-// SamplingPolicy defines the retention and precision for a series.
+// RegisterAggregateFn registers an aggregate function under the given name for use in sampling policies.
+func (ts *Registry) RegisterAggregateFn(name string, fn AggregateFn) {
+	if ts.aggregateFns == nil {
+		ts.aggregateFns = make(map[string]AggregateFn)
+	}
+	ts.aggregateFns[name] = fn
+}
+
+// SamplingPolicy defines the retention and precision for a series, and optionally an aggregate by name for collapsing buckets.
+// Use AggregateAVG or a name registered via RegisterAggregateFn. Empty string means no aggregation (same as nil).
 type SamplingPolicy struct {
-	Retention time.Duration
-	Precision time.Duration
+	Retention   time.Duration
+	Precision   time.Duration
+	AggregateFn string // name of aggregate (e.g. AggregateAVG); empty = no aggregation
 }
 
 // TimeSeries represents one time series configuration
@@ -59,15 +83,17 @@ type dbSamplingPolicy struct {
 	AggregationFn string        `gorm:"not null;size:32"`
 }
 
-const aggrDBDefault = "avg" // only aggregation supported in DB; nil AggregationFn uses AVG
-
 const mainPolicyName = "main"
 
 // RegisterSeries inserts or updates a series.
 // A main policy (Retention with positive retention duration) is required.
+// Precision must be at least 1 second (sub-second precision is not supported).
 func (ts *Registry) RegisterSeries(series TimeSeries) error {
 	if series.Retention.Retention <= 0 || series.Retention.Precision <= 0 {
 		return fmt.Errorf("main policy is required: retention and presicions must be set")
+	}
+	if series.Retention.Precision < time.Second {
+		return fmt.Errorf("precision must be at least 1 second, got %v", series.Retention.Precision)
 	}
 	return ts.db.Transaction(func(tx *gorm.DB) error {
 		existing, err := findOrCreateSeries(tx, series.Name)
@@ -103,14 +129,15 @@ func policiesByName(policies []dbSamplingPolicy) map[string]dbSamplingPolicy {
 }
 
 func upsertMainPolicy(tx *gorm.DB, seriesID uint, existingMap map[string]dbSamplingPolicy, data SamplingPolicy) error {
+	aggr := data.AggregateFn
 	existing, ok := existingMap[mainPolicyName]
 	if ok {
-		if existing.Precision == data.Precision && existing.Retention == data.Retention {
+		if existing.Precision == data.Precision && existing.Retention == data.Retention && existing.AggregationFn == aggr {
 			return nil
 		}
 		existing.Precision = data.Precision
 		existing.Retention = data.Retention
-		existing.AggregationFn = aggrDBDefault
+		existing.AggregationFn = aggr
 		if err := tx.Save(&existing).Error; err != nil {
 			return fmt.Errorf("update main policy: %w", err)
 		}
@@ -121,7 +148,7 @@ func upsertMainPolicy(tx *gorm.DB, seriesID uint, existingMap map[string]dbSampl
 		TimeSeriesID:  seriesID,
 		Precision:     data.Precision,
 		Retention:     data.Retention,
-		AggregationFn: aggrDBDefault,
+		AggregationFn: aggr,
 	}).Error; err != nil {
 		return fmt.Errorf("create main policy: %w", err)
 	}
@@ -169,7 +196,7 @@ func (ts *Registry) ListSeries() ([]TimeSeries, error) {
 		out := TimeSeries{Name: s.Name}
 		for _, p := range s.Policies {
 			if p.Name == mainPolicyName {
-				out.Retention = SamplingPolicy{Precision: p.Precision, Retention: p.Retention}
+				out.Retention = SamplingPolicy{Precision: p.Precision, Retention: p.Retention, AggregateFn: p.AggregationFn}
 				break
 			}
 		}
@@ -189,7 +216,7 @@ func (ts *Registry) GetSeries(name string) (TimeSeries, error) {
 	ret := TimeSeries{Name: series.Name}
 	for _, p := range series.Policies {
 		if p.Name == mainPolicyName {
-			ret.Retention = SamplingPolicy{Precision: p.Precision, Retention: p.Retention}
+			ret.Retention = SamplingPolicy{Precision: p.Precision, Retention: p.Retention, AggregateFn: p.AggregationFn}
 			break
 		}
 	}
@@ -218,6 +245,129 @@ func (ts *Registry) cleanOneSeries(ctx context.Context, series dbTimeSeries) err
 		if err := ts.db.WithContext(ctx).Where("sampling_id = ? AND time < ?", p.ID, cutoff).Delete(&dbRecord{}).Error; err != nil {
 			return fmt.Errorf("clean policy %s: %w", p.Name, err)
 		}
+	}
+	return nil
+}
+
+// Implementation loads reduceBucketBatchSize buckets per query so memory is O(batchSize * records per bucket)
+// and round-trips are reduced vs one query per bucket.
+const reduceBucketBatchSize = 100
+
+// reduceOneSeries iterates over the time buckets of the given series (using the main policy's precision).
+// For each bucket that has more than one value, it replaces those values with a single value from the policy's aggregate (AggregateFn name).
+// No-op if the policy's aggregate name is empty or not registered.
+//
+// Implementation uses batched bucket queries so memory is O(reduceBucketBatchSize * max records per bucket), not O(total records).
+func (ts *Registry) reduceOneSeries(ctx context.Context, name string) error {
+	mainPolicy, fn, err := ts.getSamplingPolicy(name, mainPolicyName)
+	if err != nil {
+		return err
+	}
+	if mainPolicy == nil || fn == nil {
+		return nil
+	}
+	return ts.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&dbRecord{}).Where("sampling_id = ?", mainPolicy.ID).Count(&count).Error; err != nil {
+			return fmt.Errorf("count: %w", err)
+		}
+		if count == 0 {
+			return nil
+		}
+		var minRec, maxRec dbRecord
+		if err := tx.Where("sampling_id = ?", mainPolicy.ID).Order("time ASC").First(&minRec).Error; err != nil {
+			return fmt.Errorf("min time: %w", err)
+		}
+		if err := tx.Where("sampling_id = ?", mainPolicy.ID).Order("time DESC").First(&maxRec).Error; err != nil {
+			return fmt.Errorf("max time: %w", err)
+		}
+		precision := mainPolicy.Precision
+		minTime, maxTime := minRec.Time, maxRec.Time
+		samplingID := mainPolicy.ID
+		bucketStart := minTime.Truncate(precision)
+		for !bucketStart.After(maxTime) {
+			chunkEnd := bucketStart.Add(precision * reduceBucketBatchSize)
+			if err := processReduceChunk(tx, samplingID, bucketStart, chunkEnd, precision, fn); err != nil {
+				return err
+			}
+			bucketStart = chunkEnd
+		}
+		return nil
+	})
+}
+
+func (ts *Registry) getSamplingPolicy(seriesName, PolicyName string) (*dbSamplingPolicy, AggregateFn, error) {
+	if seriesName == "" {
+		return nil, nil, fmt.Errorf("series name is required")
+	}
+	var s dbTimeSeries
+	if err := ts.db.Preload("Policies").Where("name = ?", seriesName).First(&s).Error; err != nil {
+		return nil, nil, fmt.Errorf("series not found: %w", err)
+	}
+	var mainPolicy *dbSamplingPolicy
+	for i := range s.Policies {
+		if s.Policies[i].Name == PolicyName {
+			mainPolicy = &s.Policies[i]
+			break
+		}
+	}
+	if mainPolicy == nil {
+		return nil, nil, fmt.Errorf("series has no main policy")
+	}
+	if mainPolicy.Precision <= 0 {
+		return nil, nil, fmt.Errorf("main policy has invalid precision")
+	}
+	fn := ts.aggregateFns[mainPolicy.AggregationFn]
+	if mainPolicy.AggregationFn == "" || fn == nil {
+		return nil, nil, nil
+	}
+	return mainPolicy, fn, nil
+}
+
+type reduceBucket struct {
+	records []dbRecord
+}
+
+func processReduceChunk(tx *gorm.DB, samplingID uint, chunkStart, chunkEnd time.Time, precision time.Duration, fn AggregateFn) error {
+	var recs []dbRecord
+	if err := tx.Where("sampling_id = ? AND time >= ? AND time < ?", samplingID, chunkStart, chunkEnd).Order("time ASC, id ASC").Find(&recs).Error; err != nil {
+		return fmt.Errorf("list buckets: %w", err)
+	}
+	buckets := make(map[time.Time]*reduceBucket)
+	for i := range recs {
+		t := recs[i].Time.Truncate(precision)
+		if buckets[t] == nil {
+			buckets[t] = &reduceBucket{}
+		}
+		buckets[t].records = append(buckets[t].records, recs[i])
+	}
+	for bucketStart, b := range buckets {
+		if err := reduceOneBucket(tx, bucketStart, b, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func reduceOneBucket(tx *gorm.DB, bucketStart time.Time, b *reduceBucket, fn AggregateFn) error {
+	keep := b.records[0]
+	var value float64
+	if len(b.records) > 1 {
+		values := make([]float64, len(b.records))
+		for i, r := range b.records {
+			values[i] = r.Value
+		}
+		value = fn(values)
+		for i := 1; i < len(b.records); i++ {
+			if err := tx.Delete(&dbRecord{}, b.records[i].Id).Error; err != nil {
+				return fmt.Errorf("delete duplicate in bucket: %w", err)
+			}
+		}
+	} else {
+		value = keep.Value
+	}
+	if err := tx.Model(&dbRecord{}).Where("id = ?", keep.Id).Updates(map[string]interface{}{"time": bucketStart, "value": value}).Error; err != nil {
+		return fmt.Errorf("update record: %w", err)
 	}
 	return nil
 }

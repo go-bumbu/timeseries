@@ -2,8 +2,9 @@ package timeseries_test
 
 import (
 	"fmt"
-	"github.com/go-bumbu/timeseries"
 	"time"
+
+	"github.com/go-bumbu/timeseries"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -46,7 +47,7 @@ func ExampleRegistry_e2e() {
 	}
 
 	for _, r := range records {
-		if err := registry.Ingest(r); err != nil {
+		if _, err := registry.Ingest(r.Series, r.Time, r.Value); err != nil {
 			fmt.Printf("failed to ingest record: %v\n", err)
 			return
 		}

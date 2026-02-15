@@ -1,16 +1,12 @@
 package timeseries
 
 import (
+	"errors"
 	"fmt"
 	"time"
-)
 
-type Record struct {
-	Id     uint
-	Series string
-	Time   time.Time
-	Value  float64
-}
+	"gorm.io/gorm"
+)
 
 type dbRecord struct {
 	Id         uint      `gorm:"primary_key"`
@@ -19,28 +15,29 @@ type dbRecord struct {
 	Value      float64
 }
 
-// Ingest adds a new data point
-func (ts *Registry) Ingest(in Record) error {
-	if in.Series == "" {
-		return fmt.Errorf("timeseries name cannot be empty")
+// Ingest adds a new data point and returns its ID.
+func (ts *Registry) Ingest(series string, t time.Time, value float64) (uint, error) {
+	if series == "" {
+		return 0, fmt.Errorf("timeseries name cannot be empty")
 	}
-	if in.Time.IsZero() {
-		return fmt.Errorf("timeseries time value cannot be zero")
+	if t.IsZero() {
+		return 0, fmt.Errorf("timeseries time value cannot be zero")
 	}
 
-	// Ensure series exists (create if missing)
 	var s dbTimeSeries
-	err := ts.db.Preload("Policies").Where("name = ?", in.Series).First(&s).Error
-	if err != nil {
-		return fmt.Errorf("failed to lookup series: %w", err)
+	if err := ts.db.Preload("Policies").Where("name = ?", series).First(&s).Error; err != nil {
+		return 0, fmt.Errorf("failed to lookup series: %w", err)
 	}
 
 	item := dbRecord{
 		SamplingId: s.mainPolicyID(),
-		Time:       in.Time,
-		Value:      in.Value,
+		Time:       t,
+		Value:      value,
 	}
-	return ts.db.Create(&item).Error
+	if err := ts.db.Create(&item).Error; err != nil {
+		return 0, err
+	}
+	return item.Id, nil
 }
 
 type RecordUpdate struct {
@@ -68,6 +65,13 @@ func (ts *Registry) UpdateRecord(Id uint, in RecordUpdate) error {
 	}
 
 	return ts.db.Model(&rec).Updates(updates).Error
+}
+
+type Record struct {
+	Id     uint
+	Series string
+	Time   time.Time
+	Value  float64
 }
 
 // ListRecords returns all records for a given series (main retention policy).
@@ -122,4 +126,52 @@ func (ts *Registry) DeleteRecord(id uint) error {
 		return fmt.Errorf("record id cannot be zero")
 	}
 	return ts.db.Delete(&dbRecord{}, id).Error
+}
+
+// RecordAt returns the latest record at or before the given time
+func (ts *Registry) RecordAt(series string, t time.Time) (*Record, error) {
+	if series == "" {
+		return nil, fmt.Errorf("series name cannot be empty")
+	}
+	if t.IsZero() {
+		return nil, fmt.Errorf("time cannot be zero")
+	}
+
+	var s dbTimeSeries
+	if err := ts.db.Preload("Policies").Where("name = ?", series).First(&s).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("series not found")
+		}
+		return nil, fmt.Errorf("series not found: %w", err)
+	}
+
+	mainID := s.mainPolicyID()
+	if mainID == 0 {
+		return nil, fmt.Errorf("series has no main policy")
+	}
+
+	var r dbRecord
+	err := ts.db.
+		Where("sampling_id = ? AND time <= ?", mainID, t).
+		Order("time desc").
+		First(&r).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return &Record{
+		Id:     r.Id,
+		Series: series,
+		Time:   r.Time,
+		Value:  r.Value,
+	}, nil
+}
+
+// ValueAt returns the value of the latest record at or before the given time
+func (ts *Registry) ValueAt(series string, t time.Time) (float64, error) {
+	r, err := ts.RecordAt(series, t)
+	if err != nil {
+		return 0, err
+	}
+	return r.Value, nil
 }

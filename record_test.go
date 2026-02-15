@@ -596,7 +596,7 @@ func TestListRecords(t *testing.T) {
 				wantErr:    "series name is required",
 			},
 			{
-				name:       "error on non-existing series",
+				name:       "error on nonexistent series",
 				SeriesName: "nonexistent",
 				wantErr:    "series not found: record not found",
 			},

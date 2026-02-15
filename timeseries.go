@@ -36,7 +36,7 @@ type TimeSeries struct {
 // dbTimeSeries represents one time series configuration
 type dbTimeSeries struct {
 	ID       uint               `gorm:"primaryKey;autoIncrement"`
-	Name     string             `gorm:"uniqueIndex;not null"` // logical name, must be unique
+	Name     string             `gorm:"uniqueIndex;not null;size:255"` // logical name, must be unique
 	Policies []dbSamplingPolicy `gorm:"foreignKey:TimeSeriesID;constraint:OnDelete:CASCADE"`
 }
 
@@ -52,11 +52,11 @@ func (dbTs *dbTimeSeries) mainPolicyID() uint {
 // dbSamplingPolicy defines a rollup/aggregation policy for a series
 type dbSamplingPolicy struct {
 	ID            uint          `gorm:"primaryKey"`
-	TimeSeriesID  uint          `gorm:"not null;index:idx_series_policy,unique"` // FK to dbTimeSeries.id
-	Name          string        `gorm:"not null;index:idx_series_policy,unique"` // unique per series
+	TimeSeriesID  uint          `gorm:"not null;index:idx_series_policy,unique"`          // FK to dbTimeSeries.id
+	Name          string        `gorm:"not null;index:idx_series_policy,unique;size:255"` // unique per series
 	Precision     time.Duration `gorm:"not null"`
 	Retention     time.Duration `gorm:"not null"`
-	AggregationFn string        `gorm:"not null"`
+	AggregationFn string        `gorm:"not null;size:32"`
 }
 
 const aggrDBDefault = "avg" // only aggregation supported in DB; nil AggregationFn uses AVG

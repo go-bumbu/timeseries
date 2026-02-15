@@ -6,11 +6,18 @@ default: help
 #==========================================================================================
 ##@ Testing
 #==========================================================================================
+
+.PHONY: verify
+verify: lint test-race license-check benchmark coverage ## run all tests
+
 test: ## run fast go tests
 	@go test ./...
 
+test-alldbs: ## run go full tests (uses test containers)
+	@go test ./... -alldbs
+
 test-race: ## run go full tests with race test
-	@go test ./... -race -count 10
+	@go test ./... -race
 
 lint: ## run go linter
 	@# depends on https://github.com/golangci/golangci-lint
@@ -23,9 +30,6 @@ license-check: ## check for invalid licenses
 
 benchmark: ## run go benchmarks
 	@go test -run=^$$ -bench=. ./...
-
-.PHONY: verify
-verify: lint test-race license-check benchmark coverage ## run all tests
 
 # Default coverage threshold is 80
 COVERAGE_THRESHOLD ?= 80
@@ -52,7 +56,6 @@ cover-report: ## generate a coverage report
 	go test -covermode=count -coverpkg=./... -coverprofile cover.out  ./...
 	go tool cover -html cover.out -o cover.html
 	open cover.html
-
 
 
 clean:  ## delete test generated data

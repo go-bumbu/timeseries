@@ -2,6 +2,7 @@ package timeseries
 
 import (
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestIngestSeries(t *testing.T) {
 				Series: "btc_price",
 				Value:  100.0,
 			},
-			wantErr: "timeseries time value cannot be zero",
+			wantErr: "time value cannot be zero",
 		},
 		{
 			name: "want error on missing series in getDb",
@@ -102,9 +103,8 @@ func TestIngestSeries(t *testing.T) {
 						if err == nil {
 							t.Fatalf("expected error: %s, but got none", tc.wantErr)
 						}
-
-						if err.Error() != tc.wantErr {
-							t.Errorf("expected error: %s, but got %v", tc.wantErr, err.Error())
+						if !strings.Contains(err.Error(), tc.wantErr) {
+							t.Errorf("expected error containing %q, got %v", tc.wantErr, err.Error())
 						}
 
 					} else {
@@ -139,6 +139,150 @@ func TestIngestSeries(t *testing.T) {
 						}
 					}
 
+				})
+			}
+		})
+	}
+}
+
+func TestIngestBulk(t *testing.T) {
+	tcs := []struct {
+		name      string
+		series    string
+		points    []DataPoint
+		wantIDs   int
+		wantErr   string
+		skipSetup bool // true for "unknown series" so we don't register it
+	}{
+		{
+			name:    "empty points returns nil ids",
+			series:  "bulk_empty",
+			points:  nil,
+			wantIDs: 0,
+		},
+		{
+			name:    "empty slice returns nil ids",
+			series:  "bulk_empty_slice",
+			points:  []DataPoint{},
+			wantIDs: 0,
+		},
+		{
+			name:    "single point",
+			series:  "bulk_single",
+			points:  []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 42}},
+			wantIDs: 1,
+		},
+		{
+			name:   "multiple points",
+			series: "bulk_multi",
+			points: []DataPoint{
+				{Time: getDateTime("2025-01-01 10:00:00"), Value: 1},
+				{Time: getDateTime("2025-01-01 11:00:00"), Value: 2},
+				{Time: getDateTime("2025-01-01 12:00:00"), Value: 3},
+			},
+			wantIDs: 3,
+		},
+		{
+			name:      "invalid series",
+			series:    "unknown_series",
+			points:    []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 1}},
+			wantErr:   "failed to lookup series",
+			skipSetup: true,
+		},
+		{
+			name:      "empty series name",
+			series:    "",
+			points:    []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 1}},
+			wantErr:   "timeseries name cannot be empty",
+			skipSetup: true,
+		},
+		{
+			name:      "zero time at index 0",
+			series:    "bulk_zero",
+			points:    []DataPoint{{Time: time.Time{}, Value: 1}},
+			wantErr:   "time value cannot be zero",
+			skipSetup: true,
+		},
+		{
+			name:   "zero time at index 1",
+			series: "bulk_zero_idx",
+			points: []DataPoint{
+				{Time: getDateTime("2025-01-01 10:00:00"), Value: 1},
+				{Time: time.Time{}, Value: 2},
+			},
+			wantErr:   "time value cannot be zero",
+			skipSetup: true,
+		},
+	}
+
+	for _, db := range testdbs.DBs() {
+		t.Run(db.DbType(), func(t *testing.T) {
+			dbCon := db.ConnDbName("TestIngestBulk")
+			store, err := NewRegistry(dbCon)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, tc := range tcs {
+				t.Run(tc.name, func(t *testing.T) {
+					if !tc.skipSetup {
+						ts := TimeSeries{
+							Name: tc.series,
+							Retention: SamplingPolicy{
+								Precision: time.Minute,
+								Retention: 24 * time.Hour,
+							},
+						}
+						if err := store.RegisterSeries(ts); err != nil {
+							t.Fatalf("setup: RegisterSeries: %v", err)
+						}
+					}
+
+					ids, err := store.IngestBulk(tc.series, tc.points)
+
+					if tc.wantErr != "" {
+						if err == nil {
+							t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+						}
+						if !strings.Contains(err.Error(), tc.wantErr) {
+							t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					if tc.wantIDs == 0 {
+						if ids != nil {
+							t.Errorf("expected nil ids, got len=%d", len(ids))
+						}
+						return
+					}
+					if len(ids) != tc.wantIDs {
+						t.Errorf("expected %d ids, got %d: %v", tc.wantIDs, len(ids), ids)
+					}
+					// IDs should be distinct and non-zero
+					seen := make(map[uint]bool)
+					for _, id := range ids {
+						if id == 0 {
+							t.Error("expected non-zero id")
+						}
+						if seen[id] {
+							t.Errorf("duplicate id %d", id)
+						}
+						seen[id] = true
+					}
+
+					// Verify records in DB when we inserted something
+					if tc.wantIDs > 0 && !tc.skipSetup {
+						got, err := store.ListRecords(tc.series, time.Time{}, time.Time{})
+						if err != nil {
+							t.Fatalf("ListRecords: %v", err)
+						}
+						if len(got) != tc.wantIDs {
+							t.Errorf("ListRecords: expected %d records, got %d", tc.wantIDs, len(got))
+						}
+					}
 				})
 			}
 		})

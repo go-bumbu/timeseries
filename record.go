@@ -15,29 +15,58 @@ type dbRecord struct {
 	Value      float64
 }
 
+// DataPoint is a single (time, value) pair for bulk ingest.
+type DataPoint struct {
+	Time  time.Time
+	Value float64
+}
+
 // Ingest adds a new data point and returns its ID.
 func (ts *Registry) Ingest(series string, t time.Time, value float64) (uint, error) {
-	if series == "" {
-		return 0, fmt.Errorf("timeseries name cannot be empty")
+	ids, err := ts.IngestBulk(series, []DataPoint{{Time: t, Value: value}})
+	if err != nil {
+		return 0, err
 	}
-	if t.IsZero() {
-		return 0, fmt.Errorf("timeseries time value cannot be zero")
+	return ids[0], nil
+}
+
+// IngestBulk adds multiple data points in one go and returns their IDs in order.
+// Empty points returns nil IDs and nil error. All points are validated before any insert.
+func (ts *Registry) IngestBulk(series string, points []DataPoint) ([]uint, error) {
+	if series == "" {
+		return nil, fmt.Errorf("timeseries name cannot be empty")
+	}
+	if len(points) == 0 {
+		return nil, nil
+	}
+	for i, p := range points {
+		if p.Time.IsZero() {
+			return nil, fmt.Errorf("timeseries time value cannot be zero at index %d", i)
+		}
 	}
 
 	var s dbTimeSeries
 	if err := ts.db.Preload("Policies").Where("name = ?", series).First(&s).Error; err != nil {
-		return 0, fmt.Errorf("failed to lookup series: %w", err)
+		return nil, fmt.Errorf("failed to lookup series: %w", err)
 	}
 
-	item := dbRecord{
-		SamplingId: s.mainPolicyID(),
-		Time:       t,
-		Value:      value,
+	samplingID := s.mainPolicyID()
+	items := make([]dbRecord, len(points))
+	for i, p := range points {
+		items[i] = dbRecord{
+			SamplingId: samplingID,
+			Time:       p.Time,
+			Value:      p.Value,
+		}
 	}
-	if err := ts.db.Create(&item).Error; err != nil {
-		return 0, err
+	if err := ts.db.Create(&items).Error; err != nil {
+		return nil, err
 	}
-	return item.Id, nil
+	ids := make([]uint, len(items))
+	for i := range items {
+		ids[i] = items[i].Id
+	}
+	return ids, nil
 }
 
 type RecordUpdate struct {

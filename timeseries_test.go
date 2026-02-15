@@ -618,9 +618,9 @@ func TestReduceOneSeriesBatched(t *testing.T) {
 // points (reduced to avg), others have one. Returns records to ingest and expected after reduce.
 func buildBatchedReduceInput(base time.Time, numBuckets int) (
 	records []struct {
-	t time.Time
-	v float64
-},
+		t time.Time
+		v float64
+	},
 	wantRecords []Record,
 ) {
 	hour := time.Hour

@@ -1,0 +1,32 @@
+name: Verify
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          verify: false
+          install-only: true
+          version: v2.7
+
+      - name: Install go-licence-detector
+        run: go install go.elastic.co/go-licence-detector@latest
+
+      - name: Run verify
+        run: make verify
+

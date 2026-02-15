@@ -136,7 +136,7 @@ func TestUpdateRecord(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		tcs := []struct {
 			name       string
-			policyName string // which policy the record belongs to (main, 1h, 1d)
+			policyName string // which policy the record belongs to (main only)
 			update     RecordUpdate
 			seriesName string
 			wantValue  float64 // expected value after update
@@ -148,31 +148,15 @@ func TestUpdateRecord(t *testing.T) {
 				update:     RecordUpdate{Value: ptr(999.99)},
 				seriesName: "btc_price",
 				wantValue:  999.99,
-				wantTime:   getDate("2022-01-07"),
+				wantTime:   getDateTime("2022-01-07 00:00:00"),
 			},
 			{
 				name:       "update time only in main policy",
 				policyName: "main",
-				update:     RecordUpdate{Time: ptr(getDate("2022-01-08"))},
+				update:     RecordUpdate{Time: ptr(getDateTime("2022-01-08 00:00:00"))},
 				seriesName: "eth_price",
 				wantValue:  100.0,
-				wantTime:   getDate("2022-01-08"),
-			},
-			{
-				name:       "update value in 1h downsampling policy",
-				policyName: "1h",
-				update:     RecordUpdate{Value: ptr(555.55)},
-				seriesName: "sol_price",
-				wantValue:  555.55,
-				wantTime:   getDate("2022-01-07"),
-			},
-			{
-				name:       "update time in 1d downsampling policy",
-				policyName: "1d",
-				update:     RecordUpdate{Time: ptr(getDate("2022-01-10"))},
-				seriesName: "ada_price",
-				wantValue:  100.0,
-				wantTime:   getDate("2022-01-10"),
+				wantTime:   getDateTime("2022-01-08 00:00:00"),
 			},
 		}
 
@@ -203,27 +187,12 @@ func TestUpdateRecord(t *testing.T) {
 							t.Fatalf("failed to create main policy: %v", err)
 						}
 
-						// Create the target policy for this test (might be main or downsampling)
-						var targetPolicy dbSamplingPolicy
-						if tc.policyName == "main" {
-							targetPolicy = mainPolicy
-						} else {
-							targetPolicy = dbSamplingPolicy{
-								TimeSeriesID:  series.ID,
-								Name:          tc.policyName,
-								Precision:     time.Minute,
-								Retention:     24 * time.Hour,
-								AggregationFn: "avg",
-							}
-							if err := store.db.Create(&targetPolicy).Error; err != nil {
-								t.Fatalf("failed to create %s policy: %v", tc.policyName, err)
-							}
-						}
+						targetPolicy := mainPolicy
 
 						// Create record in target policy
 						r1 := dbRecord{
 							SamplingId: targetPolicy.ID,
-							Time:       getDate("2022-01-07"),
+							Time:       getDateTime("2022-01-07 00:00:00"),
 							Value:      100.0,
 						}
 						if err := store.db.Create(&r1).Error; err != nil {
@@ -302,23 +271,13 @@ func TestDeleteRecord(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		tcs := []struct {
 			name       string
-			policyName string // which policy the record belongs to (main, 1h, 1d)
+			policyName string
 			seriesName string
 		}{
 			{
 				name:       "delete record from main policy",
 				policyName: "main",
 				seriesName: "btc_price",
-			},
-			{
-				name:       "delete record from 1h downsampling policy",
-				policyName: "1h",
-				seriesName: "eth_price",
-			},
-			{
-				name:       "delete record from 1d downsampling policy",
-				policyName: "1d",
-				seriesName: "sol_price",
 			},
 			{
 				name:       "delete non-existing record does not error",
@@ -354,27 +313,12 @@ func TestDeleteRecord(t *testing.T) {
 							t.Fatalf("failed to create main policy: %v", err)
 						}
 
-						// Create the target policy for this test
-						var targetPolicy dbSamplingPolicy
-						if tc.policyName == "main" {
-							targetPolicy = mainPolicy
-						} else {
-							targetPolicy = dbSamplingPolicy{
-								TimeSeriesID:  series.ID,
-								Name:          tc.policyName,
-								Precision:     time.Minute,
-								Retention:     24 * time.Hour,
-								AggregationFn: "avg",
-							}
-							if err := store.db.Create(&targetPolicy).Error; err != nil {
-								t.Fatalf("failed to create %s policy: %v", tc.policyName, err)
-							}
-						}
+						targetPolicy := mainPolicy
 
 						// Create record in target policy
 						r1 := dbRecord{
 							SamplingId: targetPolicy.ID,
-							Time:       getDate("2022-01-07"),
+							Time:       getDateTime("2022-01-07 00:00:00"),
 							Value:      100.0,
 						}
 						if err := store.db.Create(&r1).Error; err != nil {
@@ -450,58 +394,27 @@ func TestListRecords(t *testing.T) {
 		tcs := []struct {
 			name       string
 			SeriesName string
-			records    map[string][]Record // key is policy name (main, 1h, 1d), value is records for that policy
+			records    map[string][]Record // key is policy name (main only), value is records for that policy
 			start      time.Time
 			end        time.Time
-			want       []Record // expected output from ListRecords (returns main retention policy records)
+			want       []Record // expected output from ListRecords (main retention policy only)
 		}{
 			{
 				name:       "list multiple records from main retention",
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
+						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
 					},
 				},
 				start: time.Time{},
 				end:   time.Time{},
 				want: []Record{
-					{Time: getDate("2022-01-01"), Value: 100.0},
-					{Time: getDate("2022-01-02"), Value: 200.0},
-					{Time: getDate("2022-01-03"), Value: 300.0},
-				},
-			},
-			{
-				name:       "list records with downsampling policies",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
-						{Time: getDate("2022-01-04"), Value: 400.0},
-					},
-					"1h": {
-						{Time: getDate("2022-01-01"), Value: 150.0}, // hourly avg
-						{Time: getDate("2022-01-03"), Value: 350.0},
-					},
-					"1d": {
-						{Time: getDate("2022-01-01"), Value: 250.0}, // daily avg
-					},
-				},
-				start: time.Time{},
-				end:   time.Time{},
-				want: []Record{
-					// All records from all policies
-					{Time: getDate("2022-01-01"), Value: 100.0}, // main
-					{Time: getDate("2022-01-01"), Value: 150.0}, // 1h
-					{Time: getDate("2022-01-01"), Value: 250.0}, // 1d
-					{Time: getDate("2022-01-02"), Value: 200.0}, // main
-					{Time: getDate("2022-01-03"), Value: 300.0}, // main
-					{Time: getDate("2022-01-03"), Value: 350.0}, // 1h
-					{Time: getDate("2022-01-04"), Value: 400.0}, // main
+					{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
 				},
 			},
 			{
@@ -509,18 +422,19 @@ func TestListRecords(t *testing.T) {
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-05"), Value: 999.99},
+						{Time: getDateTime("2022-01-05 00:00:00"), Value: 999.99},
 					},
 				},
 				start: time.Time{},
 				end:   time.Time{},
 				want: []Record{
-					{Time: getDate("2022-01-05"), Value: 999.99},
+					{Time: getDateTime("2022-01-05 00:00:00"), Value: 999.99},
 				},
 			},
 			{
 				name:       "list empty series",
 				SeriesName: "banana",
+				records:    map[string][]Record{"main": {}},
 				start:      time.Time{},
 				end:        time.Time{},
 				want:       []Record{},
@@ -530,18 +444,18 @@ func TestListRecords(t *testing.T) {
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
-						{Time: getDate("2022-01-04"), Value: 400.0},
+						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
+						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
 					},
 				},
-				start: getDate("2022-01-02"),
+				start: getDateTime("2022-01-02 00:00:00"),
 				end:   time.Time{},
 				want: []Record{
-					{Time: getDate("2022-01-02"), Value: 200.0},
-					{Time: getDate("2022-01-03"), Value: 300.0},
-					{Time: getDate("2022-01-04"), Value: 400.0},
+					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
+					{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
 				},
 			},
 			{
@@ -549,18 +463,18 @@ func TestListRecords(t *testing.T) {
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
-						{Time: getDate("2022-01-04"), Value: 400.0},
+						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
+						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
 					},
 				},
 				start: time.Time{},
-				end:   getDate("2022-01-03"),
+				end:   getDateTime("2022-01-03 00:00:00"),
 				want: []Record{
-					{Time: getDate("2022-01-01"), Value: 100.0},
-					{Time: getDate("2022-01-02"), Value: 200.0},
-					{Time: getDate("2022-01-03"), Value: 300.0},
+					{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
 				},
 			},
 			{
@@ -568,39 +482,17 @@ func TestListRecords(t *testing.T) {
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
-						{Time: getDate("2022-01-04"), Value: 400.0},
+						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
+						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
 					},
 				},
-				start: getDate("2022-01-02"),
-				end:   getDate("2022-01-03"),
+				start: getDateTime("2022-01-02 00:00:00"),
+				end:   getDateTime("2022-01-03 00:00:00"),
 				want: []Record{
-					{Time: getDate("2022-01-02"), Value: 200.0},
-					{Time: getDate("2022-01-03"), Value: 300.0},
-				},
-			},
-			{
-				name:       "filter across multiple policies",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
-						{Time: getDate("2022-01-03"), Value: 300.0},
-					},
-					"1h": {
-						{Time: getDate("2022-01-01"), Value: 150.0},
-						{Time: getDate("2022-01-04"), Value: 450.0},
-					},
-				},
-				start: getDate("2022-01-02"),
-				end:   time.Time{},
-				want: []Record{
-					{Time: getDate("2022-01-02"), Value: 200.0},
-					{Time: getDate("2022-01-03"), Value: 300.0},
-					{Time: getDate("2022-01-04"), Value: 450.0},
+					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
+					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
 				},
 			},
 			{
@@ -608,12 +500,12 @@ func TestListRecords(t *testing.T) {
 				SeriesName: "banana",
 				records: map[string][]Record{
 					"main": {
-						{Time: getDate("2022-01-01"), Value: 100.0},
-						{Time: getDate("2022-01-02"), Value: 200.0},
+						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
+						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
 					},
 				},
-				start: getDate("2022-01-05"),
-				end:   getDate("2022-01-10"),
+				start: getDateTime("2022-01-05 00:00:00"),
+				end:   getDateTime("2022-01-10 00:00:00"),
 				want:  []Record{},
 			},
 		}
@@ -633,7 +525,7 @@ func TestListRecords(t *testing.T) {
 							t.Fatalf("failed to create series: %v", err)
 						}
 
-						// Create all sampling policies (main + downsampling) and their records
+						// Create main policy and records
 						for policyName, policyRecords := range tc.records {
 							policy := dbSamplingPolicy{
 								TimeSeriesID:  series.ID,

@@ -70,7 +70,7 @@ func (ts *Registry) UpdateRecord(Id uint, in RecordUpdate) error {
 	return ts.db.Model(&rec).Updates(updates).Error
 }
 
-// ListRecords returns all records for a given series name from all sampling policies.
+// ListRecords returns all records for a given series (main retention policy).
 // Optional start and end times can be provided to filter records by time range.
 // If start is zero, no lower bound is applied. If end is zero, no upper bound is applied.
 func (ts *Registry) ListRecords(name string, start, end time.Time) ([]Record, error) {
@@ -83,14 +83,12 @@ func (ts *Registry) ListRecords(name string, start, end time.Time) ([]Record, er
 		return nil, fmt.Errorf("series not found: %w", err)
 	}
 
-	// Collect all policy IDs for this series
-	policyIDs := make([]uint, len(s.Policies))
-	for i, policy := range s.Policies {
-		policyIDs[i] = policy.ID
+	mainID := s.mainPolicyID()
+	if mainID == 0 {
+		return nil, fmt.Errorf("series has no main policy")
 	}
 
-	// Query records from all policies
-	query := ts.db.Where("sampling_id IN ?", policyIDs)
+	query := ts.db.Where("sampling_id = ?", mainID)
 
 	// Apply time filters if provided
 	if !start.IsZero() {

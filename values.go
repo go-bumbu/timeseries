@@ -26,16 +26,15 @@ func (ts *Registry) RecordAt(series string, t time.Time) (*Record, error) {
 		return nil, fmt.Errorf("series not found: %w", err)
 	}
 
-	// Collect all policy IDs for this series
-	policyIDs := make([]uint, len(s.Policies))
-	for i, policy := range s.Policies {
-		policyIDs[i] = policy.ID
+	mainID := s.mainPolicyID()
+	if mainID == 0 {
+		return nil, fmt.Errorf("series has no main policy")
 	}
 
-	// Find the latest record at or before t from any policy
+	// Find the latest record at or before t
 	var r dbRecord
 	err := ts.db.
-		Where("sampling_id IN ? AND time <= ?", policyIDs, t).
+		Where("sampling_id = ? AND time <= ?", mainID, t).
 		Order("time desc").
 		First(&r).Error
 	if err != nil {

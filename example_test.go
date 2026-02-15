@@ -2,9 +2,9 @@ package timeseries_test
 
 import (
 	"fmt"
+	"github.com/go-bumbu/timeseries"
 	"time"
 
-	"github.com/andresbott/etna/libs/timeseries"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -21,25 +21,12 @@ func ExampleRegistry_e2e() {
 
 	seriesName := "btc_price"
 
-	// Register a time series with sampling policies
+	// Register a time series with retention policy
 	series := timeseries.TimeSeries{
 		Name: seriesName,
 		Retention: timeseries.SamplingPolicy{
-			Precision:     time.Minute,
-			Retention:     24 * time.Hour, // 1 day for raw data
-			AggregationFn: nil,
-		},
-		DownSampling: []timeseries.SamplingPolicy{
-			{
-				Precision:     time.Hour,
-				Retention:     7 * 24 * time.Hour, // 1 week
-				AggregationFn: nil,
-			},
-			{
-				Precision:     24 * time.Hour,
-				Retention:     30 * 24 * time.Hour, // 30 days
-				AggregationFn: nil,
-			},
+			Precision: time.Minute,
+			Retention: 24 * time.Hour, // 1 day for raw data
 		},
 	}
 

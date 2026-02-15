@@ -223,16 +223,24 @@ func (ts *Registry) GetSeries(name string) (TimeSeries, error) {
 	return ret, err
 }
 
-// Maintenance runs background tasks (e.g. retention cleanup) for all series.
+// Maintenance runs background tasks (e.g. retention cleanup and bucket reduction) for all series.
+// Errors from each series are collected and returned as a combined error; it does not stop on first failure.
 func (ts *Registry) Maintenance(ctx context.Context) error {
 	var dbSeries []dbTimeSeries
 	if err := ts.db.Preload("Policies").Find(&dbSeries).Error; err != nil {
 		return err
 	}
+	var errs []error
 	for _, item := range dbSeries {
 		if err := ts.cleanOneSeries(ctx, item); err != nil {
-			return fmt.Errorf("unable to clean series %s: %w", item.Name, err)
+			errs = append(errs, fmt.Errorf("clean series %s: %w", item.Name, err))
 		}
+		if err := ts.reduceOneSeries(ctx, item.Name); err != nil {
+			errs = append(errs, fmt.Errorf("reduce series %s: %w", item.Name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
@@ -317,8 +325,9 @@ func (ts *Registry) getSamplingPolicy(seriesName, PolicyName string) (*dbSamplin
 	if mainPolicy.Precision <= 0 {
 		return nil, nil, fmt.Errorf("main policy has invalid precision")
 	}
-	fn := ts.aggregateFns[mainPolicy.AggregationFn]
-	if mainPolicy.AggregationFn == "" || fn == nil {
+	aggrName := mainPolicy.AggregationFn
+	fn := ts.aggregateFns[aggrName]
+	if fn == nil {
 		return nil, nil, nil
 	}
 	return mainPolicy, fn, nil

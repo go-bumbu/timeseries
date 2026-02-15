@@ -231,6 +231,71 @@ func TestCleanOneSeries(t *testing.T) {
 	}
 }
 
+func TestMaintenance(t *testing.T) {
+	base := time.Now().Truncate(time.Hour)
+	oldTime := base.Add(-25 * 24 * time.Hour)
+	recentTime := base
+
+	for _, db := range testdbs.DBs() {
+		t.Run(db.DbType(), func(t *testing.T) {
+			dbCon := db.ConnDbName("TestMaintenance")
+			store, err := NewRegistry(dbCon)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Run("no series returns nil", func(t *testing.T) {
+				if err := store.Maintenance(t.Context()); err != nil {
+					t.Errorf("Maintenance with no series: %v", err)
+				}
+			})
+
+			t.Run("cleans and reduces series", func(t *testing.T) {
+				seriesName := "maint_series"
+				series := TimeSeries{
+					Name: seriesName,
+					Retention: SamplingPolicy{
+						Precision:   time.Hour,
+						Retention:   7 * 24 * time.Hour,
+						AggregateFn: AggregateAVG,
+					},
+				}
+				if err := store.RegisterSeries(series); err != nil {
+					t.Fatalf("RegisterSeries: %v", err)
+				}
+				if _, err := store.Ingest(seriesName, oldTime, 10); err != nil {
+					t.Fatalf("Ingest old: %v", err)
+				}
+				if _, err := store.Ingest(seriesName, recentTime, 20); err != nil {
+					t.Fatalf("Ingest recent: %v", err)
+				}
+				if _, err := store.Ingest(seriesName, recentTime.Add(30*time.Minute), 40); err != nil {
+					t.Fatalf("Ingest same bucket: %v", err)
+				}
+
+				if err := store.Maintenance(t.Context()); err != nil {
+					t.Fatalf("Maintenance: %v", err)
+				}
+
+				got, err := store.ListRecords(seriesName, time.Time{}, time.Time{})
+				if err != nil {
+					t.Fatalf("ListRecords: %v", err)
+				}
+				// Old record cleaned; one bucket with reduced value (avg 20, 40) = 30
+				if len(got) != 1 {
+					t.Fatalf("expected 1 record after maintenance, got %d: %v", len(got), got)
+				}
+				if got[0].Value != 30 {
+					t.Errorf("expected reduced value 30, got %v", got[0].Value)
+				}
+				if !got[0].Time.Equal(recentTime.Truncate(time.Hour)) {
+					t.Errorf("expected time %v, got %v", recentTime.Truncate(time.Hour), got[0].Time)
+				}
+			})
+		})
+	}
+}
+
 func TestReduceOneSeries(t *testing.T) {
 	tcs := []struct {
 		name        string
@@ -553,9 +618,9 @@ func TestReduceOneSeriesBatched(t *testing.T) {
 // points (reduced to avg), others have one. Returns records to ingest and expected after reduce.
 func buildBatchedReduceInput(base time.Time, numBuckets int) (
 	records []struct {
-		t time.Time
-		v float64
-	},
+	t time.Time
+	v float64
+},
 	wantRecords []Record,
 ) {
 	hour := time.Hour

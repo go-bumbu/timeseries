@@ -1,11 +1,8 @@
 package timeseries
 
 import (
-	"errors"
 	"fmt"
 	"time"
-
-	"gorm.io/gorm"
 )
 
 type dbRecord struct {
@@ -167,11 +164,12 @@ func (ts *Registry) RecordAt(series string, t time.Time) (*Record, error) {
 	}
 
 	var s dbTimeSeries
-	if err := ts.db.Preload("Policies").Where("name = ?", series).First(&s).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("series not found")
-		}
-		return nil, fmt.Errorf("series not found: %w", err)
+	res := ts.db.Preload("Policies").Where("name = ?", series).Limit(1).Find(&s)
+	if res.Error != nil {
+		return nil, fmt.Errorf("series not found: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return nil, fmt.Errorf("series not found")
 	}
 
 	mainID := s.mainPolicyID()
@@ -180,12 +178,16 @@ func (ts *Registry) RecordAt(series string, t time.Time) (*Record, error) {
 	}
 
 	var r dbRecord
-	err := ts.db.
+	resr := ts.db.
 		Where("sampling_id = ? AND time <= ?", mainID, t).
 		Order("time desc").
-		First(&r).Error
-	if err != nil {
-		return nil, err
+		Limit(1).
+		Find(&r)
+	if resr.Error != nil {
+		return nil, resr.Error
+	}
+	if resr.RowsAffected == 0 {
+		return nil, fmt.Errorf("record not found")
 	}
 
 	return &Record{

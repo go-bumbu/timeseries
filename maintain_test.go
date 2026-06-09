@@ -195,68 +195,69 @@ func TestMaintain_MultiFieldSinglePass(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			long := 100 * 365 * 24 * time.Hour
-			if err := s.DefineSeries(Series{
-				Name: "X", Precision: 24 * time.Hour, Retention: long,
-				Fields: []Field{
-					{Name: "close", Aggregate: AggLast},
-					{Name: "high", Aggregate: AggMax},
-					{Name: "raw", Aggregate: ""}, // no reduction
-				},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-			if err := s.WriteMany("X", []Point{
-				{Time: day.Add(16 * time.Hour), Values: map[string]float64{"close": 105, "high": 110, "raw": 1}},
-				{Time: day.Add(9 * time.Hour), Values: map[string]float64{"close": 101, "high": 103, "raw": 2}},
-				{Time: day.Add(12 * time.Hour), Values: map[string]float64{"close": 102, "high": 108, "raw": 3}},
-			}); err != nil {
-				t.Fatal(err)
-			}
-
-			if err := s.Maintain(context.Background()); err != nil {
-				t.Fatalf("Maintain: %v", err)
-			}
-
-			if v, found, err := s.FieldAt("X", "close", day.Add(24*time.Hour)); err != nil || !found || v != 105 {
-				t.Fatalf("close = %v found=%v err=%v, want 105 (last)", v, found, err)
-			}
-			if v, found, err := s.FieldAt("X", "high", day.Add(24*time.Hour)); err != nil || !found || v != 110 {
-				t.Fatalf("high = %v found=%v err=%v, want 110 (max)", v, found, err)
-			}
-			// raw has no aggregate -> all three rows kept
-			raws, err := s.FieldRange("X", "raw", day, day.Add(24*time.Hour))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(raws) != 3 {
-				t.Fatalf("raw rows = %d, want 3 (no reduction)", len(raws))
-			}
-			// reduced fields collapsed to one row at bucket start
-			closes, err := s.FieldRange("X", "close", day, day.Add(24*time.Hour))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(closes) != 1 || !closes[0].Time.Equal(day) {
-				t.Fatalf("close reduced = %+v, want one at bucket start", closes)
-			}
-			highs, err := s.FieldRange("X", "high", day, day.Add(24*time.Hour))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(highs) != 1 || !highs[0].Time.Equal(day) {
-				t.Fatalf("high reduced = %+v, want one at bucket start", highs)
-			}
-
-			// idempotent
-			if err := s.Maintain(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			closes2, _ := s.FieldRange("X", "close", day, day.Add(24*time.Hour))
-			if len(closes2) != 1 {
-				t.Fatalf("not idempotent: %+v", closes2)
-			}
+			runMaintainMultiField(t, s)
 		})
+	}
+}
+
+func runMaintainMultiField(t *testing.T, s *Store) {
+	t.Helper()
+	long := 100 * 365 * 24 * time.Hour
+	if err := s.DefineSeries(Series{
+		Name: "X", Precision: 24 * time.Hour, Retention: long,
+		Fields: []Field{
+			{Name: "close", Aggregate: AggLast},
+			{Name: "high", Aggregate: AggMax},
+			{Name: "raw", Aggregate: ""}, // no reduction
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.WriteMany("X", []Point{
+		{Time: day.Add(16 * time.Hour), Values: map[string]float64{"close": 105, "high": 110, "raw": 1}},
+		{Time: day.Add(9 * time.Hour), Values: map[string]float64{"close": 101, "high": 103, "raw": 2}},
+		{Time: day.Add(12 * time.Hour), Values: map[string]float64{"close": 102, "high": 108, "raw": 3}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+
+	if v, found, err := s.FieldAt("X", "close", day.Add(24*time.Hour)); err != nil || !found || v != 105 {
+		t.Fatalf("close = %v found=%v err=%v, want 105 (last)", v, found, err)
+	}
+	if v, found, err := s.FieldAt("X", "high", day.Add(24*time.Hour)); err != nil || !found || v != 110 {
+		t.Fatalf("high = %v found=%v err=%v, want 110 (max)", v, found, err)
+	}
+	raws, err := s.FieldRange("X", "raw", day, day.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raws) != 3 {
+		t.Fatalf("raw rows = %d, want 3 (no reduction)", len(raws))
+	}
+	closes, err := s.FieldRange("X", "close", day, day.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closes) != 1 || !closes[0].Time.Equal(day) {
+		t.Fatalf("close reduced = %+v, want one at bucket start", closes)
+	}
+	highs, err := s.FieldRange("X", "high", day, day.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(highs) != 1 || !highs[0].Time.Equal(day) {
+		t.Fatalf("high reduced = %+v, want one at bucket start", highs)
+	}
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closes2, _ := s.FieldRange("X", "close", day, day.Add(24*time.Hour))
+	if len(closes2) != 1 {
+		t.Fatalf("not idempotent: %+v", closes2)
 	}
 }

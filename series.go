@@ -41,22 +41,9 @@ func (s *Store) DefineSeries(cfg Series) error {
 	if cfg.Precision < time.Second {
 		return fmt.Errorf("precision must be at least 1 second, got %v", cfg.Precision)
 	}
-	seen := map[string]bool{}
-	for _, f := range cfg.Fields {
-		if f.Name == "" {
-			return fmt.Errorf("field name cannot be empty")
-		}
-		if seen[f.Name] {
-			return fmt.Errorf("duplicate field %q", f.Name)
-		}
-		seen[f.Name] = true
-		if f.Aggregate != "" {
-			if _, ok := s.aggregates[f.Aggregate]; !ok {
-				return fmt.Errorf("unknown aggregate %q", f.Aggregate)
-			}
-		}
+	if err := s.validateFields(cfg.Fields); err != nil {
+		return err
 	}
-
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		row := dbSeries{Name: cfg.Name, Precision: cfg.Precision, Retention: cfg.Retention}
 		if err := tx.Clauses(clause.OnConflict{
@@ -70,51 +57,83 @@ func (s *Store) DefineSeries(cfg Series) error {
 		if err := tx.Where("name = ?", cfg.Name).First(&ser).Error; err != nil {
 			return err
 		}
+		return s.syncSeriesFields(tx, ser.ID, cfg.Fields)
+	})
+}
 
-		var existing []dbField
-		if err := tx.Where("series_id = ?", ser.ID).Find(&existing).Error; err != nil {
+// validateFields checks field names are non-empty, unique, and use known aggregates.
+func (s *Store) validateFields(fields []Field) error {
+	seen := map[string]bool{}
+	for _, f := range fields {
+		if f.Name == "" {
+			return fmt.Errorf("field name cannot be empty")
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("duplicate field %q", f.Name)
+		}
+		seen[f.Name] = true
+		if f.Aggregate != "" {
+			if _, ok := s.aggregates[f.Aggregate]; !ok {
+				return fmt.Errorf("unknown aggregate %q", f.Aggregate)
+			}
+		}
+	}
+	return nil
+}
+
+// syncSeriesFields declaratively reconciles the DB fields for seriesID against want.
+func (s *Store) syncSeriesFields(tx *gorm.DB, seriesID uint, want []Field) error {
+	var existing []dbField
+	if err := tx.Where("series_id = ?", seriesID).Find(&existing).Error; err != nil {
+		return err
+	}
+	wantByName := make(map[string]Field, len(want))
+	for _, f := range want {
+		wantByName[f.Name] = f
+	}
+	existingByName := make(map[string]dbField, len(existing))
+	for _, ef := range existing {
+		existingByName[ef.Name] = ef
+	}
+	if err := s.deleteAbsentFields(tx, seriesID, existing, wantByName); err != nil {
+		return err
+	}
+	return s.upsertWantedFields(tx, seriesID, want, existingByName)
+}
+
+// deleteAbsentFields removes fields (and their records) not present in wantByName.
+func (s *Store) deleteAbsentFields(tx *gorm.DB, seriesID uint, existing []dbField, wantByName map[string]Field) error {
+	for _, ef := range existing {
+		if _, keep := wantByName[ef.Name]; keep {
+			continue
+		}
+		if err := tx.Where("series_id = ? AND field_id = ?", seriesID, ef.ID).Delete(&dbRecord{}).Error; err != nil {
 			return err
 		}
-		want := map[string]Field{}
-		for _, f := range cfg.Fields {
-			want[f.Name] = f
+		if err := tx.Delete(&dbField{}, ef.ID).Error; err != nil {
+			return err
 		}
-		existingByName := map[string]dbField{}
-		for _, ef := range existing {
-			existingByName[ef.Name] = ef
-		}
+	}
+	return nil
+}
 
-		// Delete fields absent from cfg.Fields, cascading their records.
-		for _, ef := range existing {
-			if _, keep := want[ef.Name]; keep {
-				continue
-			}
-			if err := tx.Where("series_id = ? AND field_id = ?", ser.ID, ef.ID).
-				Delete(&dbRecord{}).Error; err != nil {
+// upsertWantedFields creates new fields or updates the aggregate of existing ones.
+func (s *Store) upsertWantedFields(tx *gorm.DB, seriesID uint, want []Field, existingByName map[string]dbField) error {
+	for _, f := range want {
+		ef, exists := existingByName[f.Name]
+		if !exists {
+			if err := tx.Create(&dbField{SeriesId: seriesID, Name: f.Name, AggregateFn: f.Aggregate}).Error; err != nil {
 				return err
 			}
-			if err := tx.Delete(&dbField{}, ef.ID).Error; err != nil {
+			continue
+		}
+		if ef.AggregateFn != f.Aggregate {
+			if err := tx.Model(&dbField{}).Where("id = ?", ef.ID).Update("aggregate_fn", f.Aggregate).Error; err != nil {
 				return err
 			}
 		}
-
-		// Create new fields; update aggregate on existing ones.
-		for _, f := range cfg.Fields {
-			if ef, ok := existingByName[f.Name]; ok {
-				if ef.AggregateFn != f.Aggregate {
-					if err := tx.Model(&dbField{}).Where("id = ?", ef.ID).
-						Update("aggregate_fn", f.Aggregate).Error; err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			if err := tx.Create(&dbField{SeriesId: ser.ID, Name: f.Name, AggregateFn: f.Aggregate}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // GetSeries returns a series (with its fields) by name.

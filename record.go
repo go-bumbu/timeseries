@@ -1,9 +1,11 @@
 package timeseries
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -11,9 +13,9 @@ import (
 // PK order (series_id, time, field_id) keeps each series contiguous in time,
 // optimal for whole-series pivot reads.
 type dbRecord struct {
-	SeriesId uint      `gorm:"primaryKey;autoIncrement:false"`
+	SeriesID uint      `gorm:"column:series_id;primaryKey;autoIncrement:false"`
 	Time     unixMilli `gorm:"primaryKey;autoIncrement:false"`
-	FieldId  uint      `gorm:"primaryKey;autoIncrement:false"`
+	FieldID  uint      `gorm:"column:field_id;primaryKey;autoIncrement:false"`
 	Value    float64
 }
 
@@ -32,16 +34,22 @@ type Sample struct {
 }
 
 // Write upserts one multi-field point.
-func (s *Store) Write(series string, p Point) error {
-	return s.WriteMany(series, []Point{p})
+func (s *Store) Write(ctx context.Context, series string, p Point) error {
+	return s.WriteMany(ctx, series, []Point{p})
 }
 
-// WriteMany upserts many points in one transaction. All points are validated first.
-func (s *Store) WriteMany(series string, ps []Point) error {
+// WriteMany upserts many points. Every point's time and every field name is
+// resolved and validated before any row is inserted, and the whole batch is
+// applied in a single transaction, so a write either lands in full or not at
+// all (no partial batches on failure).
+func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error {
 	if len(ps) == 0 {
 		return nil
 	}
-	sid, err := s.seriesID(series)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return err
 	}
@@ -56,15 +64,15 @@ func (s *Store) WriteMany(series string, ps []Point) error {
 		for name, val := range p.Values {
 			fid, ok := fieldIDs[name]
 			if !ok {
-				fid, err = s.fieldID(sid, name)
+				fid, err = s.fieldID(ctx, sid, name)
 				if err != nil {
 					return err
 				}
 				fieldIDs[name] = fid
 			}
 			rows = append(rows, dbRecord{
-				SeriesId: sid,
-				FieldId:  fid,
+				SeriesID: sid,
+				FieldID:  fid,
 				Time:     unixMilli(p.Time),
 				Value:    val,
 			})
@@ -74,26 +82,33 @@ func (s *Store) WriteMany(series string, ps []Point) error {
 		return nil
 	}
 
-	return s.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "series_id"}, {Name: "field_id"}, {Name: "time"}},
-		DoUpdates: clause.AssignmentColumns([]string{"value"}),
-	}).CreateInBatches(&rows, 500).Error
+	// Conflict columns are listed in PK order (series_id, time, field_id) so the
+	// upsert target matches the composite primary key on every dialect.
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "series_id"}, {Name: "time"}, {Name: "field_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value"}),
+		}).CreateInBatches(&rows, 500).Error
+	})
 }
 
 // Range returns points in [start, end], pivoting records that share an exact
-// timestamp into one Point. Returned in ascending time order.
-func (s *Store) Range(series string, start, end time.Time) ([]Point, error) {
-	sid, err := s.seriesID(series)
+// timestamp into one Point. Returned in ascending time order. Pass a zero
+// time.Time for an unbounded start or end.
+func (s *Store) Range(ctx context.Context, series string, start, end time.Time) ([]Point, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return nil, err
 	}
-	names, err := s.fieldNames(sid)
+	names, err := s.fieldNames(ctx, sid)
 	if err != nil {
 		return nil, err
 	}
 
 	var recs []dbRecord
-	q := s.db.Where("series_id = ?", sid)
+	q := s.db.WithContext(ctx).Where("series_id = ?", sid)
 	if !start.IsZero() {
 		q = q.Where("time >= ?", unixMilli(start))
 	}
@@ -112,23 +127,26 @@ func (s *Store) Range(series string, start, end time.Time) ([]Point, error) {
 			out = append(out, Point{Time: ts, Values: map[string]float64{}})
 			cur = &out[len(out)-1]
 		}
-		cur.Values[names[r.FieldId]] = r.Value
+		cur.Values[names[r.FieldID]] = r.Value
 	}
 	return out, nil
 }
 
 // FieldRange returns one field's scalar samples in [start, end], time-ascending.
-func (s *Store) FieldRange(series, field string, start, end time.Time) ([]Sample, error) {
-	sid, err := s.seriesID(series)
+// Pass a zero time.Time for an unbounded start or end.
+func (s *Store) FieldRange(ctx context.Context, series, field string, start, end time.Time) ([]Sample, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return nil, err
 	}
-	fid, err := s.fieldID(sid, field)
+	fid, err := s.fieldID(ctx, sid, field)
 	if err != nil {
 		return nil, err
 	}
 	var recs []dbRecord
-	q := s.db.Where("series_id = ? AND field_id = ?", sid, fid)
+	q := s.db.WithContext(ctx).Where("series_id = ? AND field_id = ?", sid, fid)
 	if !start.IsZero() {
 		q = q.Where("time >= ?", unixMilli(start))
 	}
@@ -146,17 +164,19 @@ func (s *Store) FieldRange(series, field string, start, end time.Time) ([]Sample
 }
 
 // FieldAt returns the latest value of a field at or before t.
-func (s *Store) FieldAt(series, field string, t time.Time) (float64, bool, error) {
-	sid, err := s.seriesID(series)
+func (s *Store) FieldAt(ctx context.Context, series, field string, t time.Time) (float64, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return 0, false, err
 	}
-	fid, err := s.fieldID(sid, field)
+	fid, err := s.fieldID(ctx, sid, field)
 	if err != nil {
 		return 0, false, err
 	}
 	var r dbRecord
-	res := s.db.Where("series_id = ? AND field_id = ? AND time <= ?", sid, fid, unixMilli(t)).
+	res := s.db.WithContext(ctx).Where("series_id = ? AND field_id = ? AND time <= ?", sid, fid, unixMilli(t)).
 		Order("time DESC").Limit(1).Find(&r)
 	if res.Error != nil {
 		return 0, false, res.Error
@@ -169,54 +189,63 @@ func (s *Store) FieldAt(series, field string, t time.Time) (float64, bool, error
 
 // At returns an as-of snapshot: each field's latest value at or before t.
 // The returned Point.Time is the query time t; per-field source timestamps are not kept.
-func (s *Store) At(series string, t time.Time) (Point, error) {
-	sid, err := s.seriesID(series)
+func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return Point{}, err
 	}
-	names, err := s.fieldNames(sid)
+	names, err := s.fieldNames(ctx, sid)
 	if err != nil {
 		return Point{}, err
 	}
 
 	// Portable "latest per field <= t": match rows whose time equals the per-field max <= t.
+	// The table name comes from dbRecord.TableName() so this raw query follows a rename.
+	tbl := dbRecord{}.TableName()
 	var recs []dbRecord
-	err = s.db.Raw(`
+	err = s.db.WithContext(ctx).Raw(fmt.Sprintf(`
 		SELECT r.series_id, r.field_id, r.time, r.value
-		FROM records r
+		FROM %[1]s r
 		WHERE r.series_id = ? AND r.time <= ?
 		  AND r.time = (
-			SELECT MAX(r2.time) FROM records r2
+			SELECT MAX(r2.time) FROM %[1]s r2
 			WHERE r2.series_id = r.series_id AND r2.field_id = r.field_id AND r2.time <= ?
 		  )
-	`, sid, unixMilli(t), unixMilli(t)).Scan(&recs).Error
+	`, tbl), sid, unixMilli(t), unixMilli(t)).Scan(&recs).Error
 	if err != nil {
 		return Point{}, err
 	}
 
 	out := Point{Time: t, Values: map[string]float64{}}
 	for _, r := range recs {
-		out.Values[names[r.FieldId]] = r.Value
+		out.Values[names[r.FieldID]] = r.Value
 	}
 	return out, nil
 }
 
 // Delete removes all fields at exactly t for the series.
-func (s *Store) Delete(series string, t time.Time) error {
-	sid, err := s.seriesID(series)
+func (s *Store) Delete(ctx context.Context, series string, t time.Time) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return err
 	}
-	return s.db.Where("series_id = ? AND time = ?", sid, unixMilli(t)).Delete(&dbRecord{}).Error
+	return s.db.WithContext(ctx).Where("series_id = ? AND time = ?", sid, unixMilli(t)).Delete(&dbRecord{}).Error
 }
 
-// DeleteRange removes all records in [start, end] for the series.
-func (s *Store) DeleteRange(series string, start, end time.Time) error {
-	sid, err := s.seriesID(series)
+// DeleteRange removes all records in [start, end] for the series. Pass a zero
+// time.Time for an unbounded start or end.
+func (s *Store) DeleteRange(ctx context.Context, series string, start, end time.Time) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return err
 	}
-	q := s.db.Where("series_id = ?", sid)
+	q := s.db.WithContext(ctx).Where("series_id = ?", sid)
 	if !start.IsZero() {
 		q = q.Where("time >= ?", unixMilli(start))
 	}

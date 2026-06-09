@@ -13,7 +13,15 @@ const reduceChunkBuckets = 100
 
 // Maintain runs retention cleanup and per-field bucket reduction for all series.
 // Errors are collected per series; it does not stop on the first failure.
+//
+// Maintain takes the Store lock exclusively, so it cannot run concurrently with
+// writes or reads on the same Store. This closes the window where a point
+// written into a bucket between the reducer's read and its delete-then-recreate
+// would be lost. Because it holds the lock for the whole sweep, run it from a
+// dedicated maintenance goroutine, not on a hot read/write path.
 func (s *Store) Maintain(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var all []dbSeries
 	if err := s.db.WithContext(ctx).Find(&all).Error; err != nil {
 		return err
@@ -104,10 +112,10 @@ func (s *Store) reduceSeriesChunk(tx *gorm.DB, seriesID uint, start, end time.Ti
 	groups := map[key][]float64{}
 	var order []key
 	for _, r := range recs {
-		if _, ok := aggByField[r.FieldId]; !ok {
+		if _, ok := aggByField[r.FieldID]; !ok {
 			continue // field has no aggregate: leave its rows untouched
 		}
-		k := key{field: r.FieldId, bucket: r.Time.asTime().Truncate(precision)}
+		k := key{field: r.FieldID, bucket: r.Time.asTime().Truncate(precision)}
 		if _, seen := groups[k]; !seen {
 			order = append(order, k)
 		}
@@ -126,8 +134,8 @@ func (s *Store) reduceSeriesChunk(tx *gorm.DB, seriesID uint, start, end time.Ti
 			return err
 		}
 		if err := tx.Create(&dbRecord{
-			SeriesId: seriesID,
-			FieldId:  k.field,
+			SeriesID: seriesID,
+			FieldID:  k.field,
 			Time:     unixMilli(k.bucket),
 			Value:    reduced,
 		}).Error; err != nil {

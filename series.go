@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -31,7 +32,11 @@ type Series struct {
 // fields: fields absent from cfg.Fields are deleted (cascading their records),
 // new fields are created, and existing fields' aggregates are updated. All in
 // one transaction.
-func (s *Store) DefineSeries(cfg Series) error {
+//
+// DefineSeries takes the Store lock exclusively: it cannot run concurrently
+// with writes, reads, or Maintain on the same Store, which is what keeps a
+// field deletion from racing a concurrent write into orphan records.
+func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("series name cannot be empty")
 	}
@@ -41,10 +46,12 @@ func (s *Store) DefineSeries(cfg Series) error {
 	if cfg.Precision < time.Second {
 		return fmt.Errorf("precision must be at least 1 second, got %v", cfg.Precision)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.validateFields(cfg.Fields); err != nil {
 		return err
 	}
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		row := dbSeries{Name: cfg.Name, Precision: cfg.Precision, Retention: cfg.Retention}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "name"}},
@@ -122,7 +129,7 @@ func (s *Store) upsertWantedFields(tx *gorm.DB, seriesID uint, want []Field, exi
 	for _, f := range want {
 		ef, exists := existingByName[f.Name]
 		if !exists {
-			if err := tx.Create(&dbField{SeriesId: seriesID, Name: f.Name, AggregateFn: f.Aggregate}).Error; err != nil {
+			if err := tx.Create(&dbField{SeriesID: seriesID, Name: f.Name, AggregateFn: f.Aggregate}).Error; err != nil {
 				return err
 			}
 			continue
@@ -137,15 +144,17 @@ func (s *Store) upsertWantedFields(tx *gorm.DB, seriesID uint, want []Field, exi
 }
 
 // GetSeries returns a series (with its fields) by name.
-func (s *Store) GetSeries(name string) (Series, error) {
+func (s *Store) GetSeries(ctx context.Context, name string) (Series, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var row dbSeries
-	if err := s.db.Where("name = ?", name).First(&row).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("name = ?", name).First(&row).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return Series{}, fmt.Errorf("series %q not found", name)
+			return Series{}, fmt.Errorf("series %q: %w", name, ErrSeriesNotFound)
 		}
 		return Series{}, err
 	}
-	fields, err := s.seriesFields(row.ID)
+	fields, err := s.seriesFields(ctx, row.ID)
 	if err != nil {
 		return Series{}, err
 	}
@@ -153,9 +162,11 @@ func (s *Store) GetSeries(name string) (Series, error) {
 }
 
 // ListSeries returns all series, each with its fields.
-func (s *Store) ListSeries() ([]Series, error) {
+func (s *Store) ListSeries(ctx context.Context) ([]Series, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var rows []dbSeries
-	if err := s.db.Order("name ASC").Find(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).Order("name ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -170,23 +181,26 @@ func (s *Store) ListSeries() ([]Series, error) {
 		out[i] = Series{Name: r.Name, Precision: r.Precision, Retention: r.Retention}
 	}
 	var fields []dbField
-	if err := s.db.Where("series_id IN ?", ids).Order("name ASC").Find(&fields).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("series_id IN ?", ids).Order("name ASC").Find(&fields).Error; err != nil {
 		return nil, err
 	}
 	for _, f := range fields {
-		i := idx[f.SeriesId]
+		i := idx[f.SeriesID]
 		out[i].Fields = append(out[i].Fields, Field{Name: f.Name, Aggregate: f.AggregateFn})
 	}
 	return out, nil
 }
 
 // DropSeries removes a series and all of its records (application-level cascade).
-func (s *Store) DropSeries(name string) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
+// It takes the Store lock exclusively.
+func (s *Store) DropSeries(ctx context.Context, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row dbSeries
 		if err := tx.Where("name = ?", name).First(&row).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("series %q not found", name)
+				return fmt.Errorf("series %q: %w", name, ErrSeriesNotFound)
 			}
 			return err
 		}
@@ -201,11 +215,11 @@ func (s *Store) DropSeries(name string) error {
 }
 
 // seriesID resolves a series name to its id; errors if undefined.
-func (s *Store) seriesID(name string) (uint, error) {
+func (s *Store) seriesID(ctx context.Context, name string) (uint, error) {
 	var row dbSeries
-	if err := s.db.Where("name = ?", name).First(&row).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("name = ?", name).First(&row).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 0, fmt.Errorf("series %q not found", name)
+			return 0, fmt.Errorf("series %q: %w", name, ErrSeriesNotFound)
 		}
 		return 0, err
 	}

@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -11,7 +12,7 @@ import (
 // series; (series_id, name) is unique. Integrity is application-level (no FK).
 type dbField struct {
 	ID          uint   `gorm:"primaryKey;autoIncrement"`
-	SeriesId    uint   `gorm:"not null;uniqueIndex:idx_series_field,priority:1"`
+	SeriesID    uint   `gorm:"column:series_id;not null;uniqueIndex:idx_series_field,priority:1"`
 	Name        string `gorm:"not null;size:64;uniqueIndex:idx_series_field,priority:2"`
 	AggregateFn string `gorm:"not null;size:32"`
 }
@@ -25,11 +26,11 @@ type Field struct {
 }
 
 // fieldID resolves a field name within a series to its id; errors if undefined.
-func (s *Store) fieldID(seriesID uint, name string) (uint, error) {
+func (s *Store) fieldID(ctx context.Context, seriesID uint, name string) (uint, error) {
 	var f dbField
-	if err := s.db.Where("series_id = ? AND name = ?", seriesID, name).First(&f).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("series_id = ? AND name = ?", seriesID, name).First(&f).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 0, fmt.Errorf("field %q is not defined for this series", name)
+			return 0, fmt.Errorf("field %q: %w", name, ErrFieldNotFound)
 		}
 		return 0, err
 	}
@@ -37,9 +38,9 @@ func (s *Store) fieldID(seriesID uint, name string) (uint, error) {
 }
 
 // fieldNames returns an id->name map for one series' fields.
-func (s *Store) fieldNames(seriesID uint) (map[uint]string, error) {
+func (s *Store) fieldNames(ctx context.Context, seriesID uint) (map[uint]string, error) {
 	var rows []dbField
-	if err := s.db.Where("series_id = ?", seriesID).Find(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("series_id = ?", seriesID).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	m := make(map[uint]string, len(rows))
@@ -50,9 +51,9 @@ func (s *Store) fieldNames(seriesID uint) (map[uint]string, error) {
 }
 
 // seriesFields returns one series' fields as API values, name-ascending.
-func (s *Store) seriesFields(seriesID uint) ([]Field, error) {
+func (s *Store) seriesFields(ctx context.Context, seriesID uint) ([]Field, error) {
 	var rows []dbField
-	if err := s.db.Where("series_id = ?", seriesID).Order("name ASC").Find(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("series_id = ?", seriesID).Order("name ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]Field, len(rows))

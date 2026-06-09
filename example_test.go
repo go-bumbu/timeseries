@@ -1,6 +1,7 @@
 package timeseries_test
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -19,7 +20,8 @@ func ExampleStore() {
 		return
 	}
 
-	_ = ts.DefineSeries(timeseries.Series{
+	ctx := context.Background()
+	_ = ts.DefineSeries(ctx, timeseries.Series{
 		Name:      "AAPL",
 		Precision: 24 * time.Hour,
 		Retention: 10 * 365 * 24 * time.Hour,
@@ -30,9 +32,9 @@ func ExampleStore() {
 	})
 
 	day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
-	_ = ts.Write("AAPL", timeseries.Point{Time: day, Values: map[string]float64{"close": 102.1, "high": 103.0}})
+	_ = ts.Write(ctx, "AAPL", timeseries.Point{Time: day, Values: map[string]float64{"close": 102.1, "high": 103.0}})
 
-	v, _, _ := ts.FieldAt("AAPL", "close", day)
+	v, _, _ := ts.FieldAt(ctx, "AAPL", "close", day)
 	fmt.Printf("close=%.1f\n", v)
 
 	// Output:

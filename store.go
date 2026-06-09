@@ -1,19 +1,45 @@
 package timeseries
 
-import "gorm.io/gorm"
+import (
+	"errors"
+	"sync"
+
+	"gorm.io/gorm"
+)
 
 // AggregateFn collapses the values in a precision bucket into one value.
 // Values are passed in ascending time order (so first = values[0], last = values[len-1]).
 type AggregateFn func(values []float64) float64
 
+// ErrSeriesNotFound is returned (wrapped) when a named series does not exist.
+// Test for it with errors.Is.
+var ErrSeriesNotFound = errors.New("series not found")
+
+// ErrFieldNotFound is returned (wrapped) when a field is not defined for a series.
+// Test for it with errors.Is.
+var ErrFieldNotFound = errors.New("field not found")
+
 // Store is the time series handle.
+//
+// All exported methods serialize against each other through an internal
+// RWMutex: structural operations (DefineSeries, DropSeries, Maintain,
+// RegisterAggregate) take it exclusively, while reads and point writes take it
+// shared. This makes a single Store safe for concurrent use and closes the
+// orphan-record and reduce-window races between DefineSeries/Maintain and
+// concurrent writers. It does NOT coordinate across multiple Store instances or
+// other processes pointed at the same database — application-level integrity
+// still assumes all writes go through one Store.
 type Store struct {
 	db         *gorm.DB
+	mu         sync.RWMutex
 	aggregates map[string]AggregateFn
 }
 
 // New migrates the schema and returns a Store with the built-in aggregates registered.
 func New(db *gorm.DB) (*Store, error) {
+	if db == nil {
+		return nil, errors.New("timeseries: db must not be nil")
+	}
 	// Dimension tables are ordinary rowid tables (they use autoincrement IDs,
 	// which WITHOUT ROWID forbids).
 	if err := db.AutoMigrate(&dbSeries{}, &dbField{}); err != nil {
@@ -44,8 +70,11 @@ const (
 	AggLast  = "last"
 )
 
-// RegisterAggregate registers (or overrides) an aggregate by name.
+// RegisterAggregate registers (or overrides) an aggregate by name. It is safe
+// to call concurrently with other Store operations.
 func (s *Store) RegisterAggregate(name string, fn AggregateFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.aggregates == nil {
 		s.aggregates = make(map[string]AggregateFn)
 	}

@@ -41,7 +41,7 @@ func TestTiming(t *testing.T) {
 					t.Fatal(err)
 				}
 				base := time.Now().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
-				if err := s.DefineSeries(Series{
+				if err := s.DefineSeries(context.Background(), Series{
 					Name: "ts", Precision: time.Hour, Retention: 365 * 24 * time.Hour,
 					Fields: []Field{{Name: "v", Aggregate: AggAvg}},
 				}); err != nil {
@@ -53,7 +53,7 @@ func TestTiming(t *testing.T) {
 					pts[i] = Point{Time: base.Add(time.Duration(i) * time.Minute), Values: map[string]float64{"v": float64(i)}}
 				}
 				t1 := time.Now()
-				if err := s.WriteMany("ts", pts); err != nil {
+				if err := s.WriteMany(context.Background(), "ts", pts); err != nil {
 					t.Fatal(err)
 				}
 				ingestDurs = append(ingestDurs, time.Since(t1))
@@ -61,7 +61,7 @@ func TestTiming(t *testing.T) {
 				_ = s.Maintain(context.Background())
 
 				t3 := time.Now()
-				if _, err := s.FieldRange("ts", "v", base, base.Add(time.Duration(timingNumIngest)*time.Minute)); err != nil {
+				if _, err := s.FieldRange(context.Background(), "ts", "v", base, base.Add(time.Duration(timingNumIngest)*time.Minute)); err != nil {
 					t.Fatal(err)
 				}
 				retrieveDurs = append(retrieveDurs, time.Since(t3))
@@ -84,7 +84,7 @@ func TestStorageFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DefineSeries(Series{
+	if err := s.DefineSeries(context.Background(), Series{
 		Name: "fp", Precision: 24 * time.Hour, Retention: 100 * 365 * 24 * time.Hour,
 		Fields: []Field{{Name: "v", Aggregate: ""}},
 	}); err != nil {
@@ -97,7 +97,7 @@ func TestStorageFootprint(t *testing.T) {
 	for i := range pts {
 		pts[i] = Point{Time: base.Add(time.Duration(i) * time.Minute), Values: map[string]float64{"v": float64(i)}}
 	}
-	if err := s.WriteMany("fp", pts); err != nil {
+	if err := s.WriteMany(context.Background(), "fp", pts); err != nil {
 		t.Fatal(err)
 	}
 	sqlDB, _ := db.DB()

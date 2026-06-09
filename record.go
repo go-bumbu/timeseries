@@ -3,206 +3,236 @@ package timeseries
 import (
 	"fmt"
 	"time"
+
+	"gorm.io/gorm/clause"
 )
 
+// dbRecord is the clustered fact table: one row per (series, field, time).
 type dbRecord struct {
-	Id         uint      `gorm:"primary_key"`
-	SamplingId uint      `gorm:"index"`
-	Time       time.Time `gorm:"index"`
-	Value      float64
+	SeriesId uint      `gorm:"primaryKey;autoIncrement:false"`
+	FieldId  uint      `gorm:"primaryKey;autoIncrement:false"`
+	Time     unixMilli `gorm:"primaryKey;autoIncrement:false"`
+	Value    float64
 }
 
-// DataPoint is a single (time, value) pair for bulk ingest.
-type DataPoint struct {
+func (dbRecord) TableName() string { return "records" }
+
+// Point is one timestamp with a set of named field values.
+type Point struct {
+	Time   time.Time
+	Values map[string]float64
+}
+
+// Sample is a single (time, value) pair for one field.
+type Sample struct {
 	Time  time.Time
 	Value float64
 }
 
-// Ingest adds a new data point and returns its ID.
-func (ts *Registry) Ingest(series string, t time.Time, value float64) (uint, error) {
-	ids, err := ts.IngestBulk(series, []DataPoint{{Time: t, Value: value}})
-	if err != nil {
-		return 0, err
-	}
-	return ids[0], nil
+// Write upserts one multi-field point.
+func (s *Store) Write(series string, p Point) error {
+	return s.WriteMany(series, []Point{p})
 }
 
-// IngestBulk adds multiple data points in one go and returns their IDs in order.
-// Empty points returns nil IDs and nil error. All points are validated before any insert.
-func (ts *Registry) IngestBulk(series string, points []DataPoint) ([]uint, error) {
-	if series == "" {
-		return nil, fmt.Errorf("timeseries name cannot be empty")
+// WriteMany upserts many points in one transaction. All points are validated first.
+func (s *Store) WriteMany(series string, ps []Point) error {
+	if len(ps) == 0 {
+		return nil
 	}
-	if len(points) == 0 {
-		return nil, nil
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return err
 	}
-	for i, p := range points {
+
+	// Resolve field names to ids once (cache across all points).
+	fieldIDs := map[string]uint{}
+	var rows []dbRecord
+	for i, p := range ps {
 		if p.Time.IsZero() {
-			return nil, fmt.Errorf("timeseries time value cannot be zero at index %d", i)
+			return fmt.Errorf("point %d: time cannot be zero", i)
+		}
+		for name, val := range p.Values {
+			fid, ok := fieldIDs[name]
+			if !ok {
+				fid, err = s.fieldID(name)
+				if err != nil {
+					return err
+				}
+				fieldIDs[name] = fid
+			}
+			rows = append(rows, dbRecord{
+				SeriesId: sid,
+				FieldId:  fid,
+				Time:     unixMilli(p.Time),
+				Value:    val,
+			})
 		}
 	}
-
-	var s dbTimeSeries
-	if err := ts.db.Preload("Policies").Where("name = ?", series).First(&s).Error; err != nil {
-		return nil, fmt.Errorf("failed to lookup series: %w", err)
+	if len(rows) == 0 {
+		return nil
 	}
 
-	samplingID := s.mainPolicyID()
-	items := make([]dbRecord, len(points))
-	for i, p := range points {
-		items[i] = dbRecord{
-			SamplingId: samplingID,
-			Time:       p.Time,
-			Value:      p.Value,
-		}
-	}
-	if err := ts.db.Create(&items).Error; err != nil {
+	return s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "series_id"}, {Name: "field_id"}, {Name: "time"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value"}),
+	}).CreateInBatches(&rows, 500).Error
+}
+
+// fieldNames returns an id->name map for all defined fields.
+func (s *Store) fieldNames() (map[uint]string, error) {
+	var rows []dbField
+	if err := s.db.Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	ids := make([]uint, len(items))
-	for i := range items {
-		ids[i] = items[i].Id
+	m := make(map[uint]string, len(rows))
+	for _, r := range rows {
+		m[r.ID] = r.Name
 	}
-	return ids, nil
+	return m, nil
 }
 
-type RecordUpdate struct {
-	Time  *time.Time
-	Value *float64
-}
-
-// UpdateRecord updates an existing record
-func (ts *Registry) UpdateRecord(Id uint, in RecordUpdate) error {
-	if Id == 0 {
-		return fmt.Errorf("record id is required for update")
+// Range returns points in [start, end], pivoting records that share an exact
+// timestamp into one Point. Returned in ascending time order.
+func (s *Store) Range(series string, start, end time.Time) ([]Point, error) {
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return nil, err
+	}
+	names, err := s.fieldNames()
+	if err != nil {
+		return nil, err
 	}
 
-	var rec dbRecord
-	if err := ts.db.First(&rec, Id).Error; err != nil {
-		return fmt.Errorf("record not found: %w", err)
-	}
-
-	updates := make(map[string]interface{})
-	if in.Time != nil {
-		updates["time"] = *in.Time
-	}
-	if in.Value != nil {
-		updates["value"] = *in.Value
-	}
-
-	return ts.db.Model(&rec).Updates(updates).Error
-}
-
-type Record struct {
-	Id     uint
-	Series string
-	Time   time.Time
-	Value  float64
-}
-
-// ListRecords returns all records for a given series (main retention policy).
-// Optional start and end times can be provided to filter records by time range.
-// If start is zero, no lower bound is applied. If end is zero, no upper bound is applied.
-func (ts *Registry) ListRecords(name string, start, end time.Time) ([]Record, error) {
-	if name == "" {
-		return nil, fmt.Errorf("series name is required")
-	}
-
-	var s dbTimeSeries
-	if err := ts.db.Preload("Policies").Where("name = ?", name).First(&s).Error; err != nil {
-		return nil, fmt.Errorf("series not found: %w", err)
-	}
-
-	mainID := s.mainPolicyID()
-	if mainID == 0 {
-		return nil, fmt.Errorf("series has no main policy")
-	}
-
-	query := ts.db.Where("sampling_id = ?", mainID)
-
-	// Apply time filters if provided
+	var recs []dbRecord
+	q := s.db.Where("series_id = ?", sid)
 	if !start.IsZero() {
-		query = query.Where("time >= ?", start)
+		q = q.Where("time >= ?", unixMilli(start))
 	}
 	if !end.IsZero() {
-		query = query.Where("time <= ?", end)
+		q = q.Where("time <= ?", unixMilli(end))
+	}
+	if err := q.Order("time ASC, field_id ASC").Find(&recs).Error; err != nil {
+		return nil, err
 	}
 
-	var dbRecs []dbRecord
-	if err := query.Order("time ASC").Find(&dbRecs).Error; err != nil {
-		return nil, fmt.Errorf("failed to list records: %w", err)
-	}
-
-	out := make([]Record, len(dbRecs))
-	for i, r := range dbRecs {
-		out[i] = Record{
-			Id:     r.Id,
-			Series: name,
-			Time:   r.Time,
-			Value:  r.Value,
+	var out []Point
+	var cur *Point
+	for _, r := range recs {
+		ts := r.Time.asTime()
+		if cur == nil || !cur.Time.Equal(ts) {
+			out = append(out, Point{Time: ts, Values: map[string]float64{}})
+			cur = &out[len(out)-1]
 		}
+		cur.Values[names[r.FieldId]] = r.Value
 	}
-
 	return out, nil
 }
 
-// DeleteRecord removes a record by its id, does NOT return an error if the record does not exist
-func (ts *Registry) DeleteRecord(id uint) error {
-	if id == 0 {
-		return fmt.Errorf("record id cannot be zero")
+// FieldRange returns one field's scalar samples in [start, end], time-ascending.
+func (s *Store) FieldRange(series, field string, start, end time.Time) ([]Sample, error) {
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return nil, err
 	}
-	return ts.db.Delete(&dbRecord{}, id).Error
+	fid, err := s.fieldID(field)
+	if err != nil {
+		return nil, err
+	}
+	var recs []dbRecord
+	q := s.db.Where("series_id = ? AND field_id = ?", sid, fid)
+	if !start.IsZero() {
+		q = q.Where("time >= ?", unixMilli(start))
+	}
+	if !end.IsZero() {
+		q = q.Where("time <= ?", unixMilli(end))
+	}
+	if err := q.Order("time ASC").Find(&recs).Error; err != nil {
+		return nil, err
+	}
+	out := make([]Sample, len(recs))
+	for i, r := range recs {
+		out[i] = Sample{Time: r.Time.asTime(), Value: r.Value}
+	}
+	return out, nil
 }
 
-// RecordAt returns the latest record at or before the given time
-func (ts *Registry) RecordAt(series string, t time.Time) (*Record, error) {
-	if series == "" {
-		return nil, fmt.Errorf("series name cannot be empty")
+// FieldAt returns the latest value of a field at or before t.
+func (s *Store) FieldAt(series, field string, t time.Time) (float64, bool, error) {
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return 0, false, err
 	}
-	if t.IsZero() {
-		return nil, fmt.Errorf("time cannot be zero")
+	fid, err := s.fieldID(field)
+	if err != nil {
+		return 0, false, err
 	}
-
-	var s dbTimeSeries
-	res := ts.db.Preload("Policies").Where("name = ?", series).Limit(1).Find(&s)
+	var r dbRecord
+	res := s.db.Where("series_id = ? AND field_id = ? AND time <= ?", sid, fid, unixMilli(t)).
+		Order("time DESC").Limit(1).Find(&r)
 	if res.Error != nil {
-		return nil, fmt.Errorf("series not found: %w", res.Error)
+		return 0, false, res.Error
 	}
 	if res.RowsAffected == 0 {
-		return nil, fmt.Errorf("series not found")
+		return 0, false, nil
 	}
-
-	mainID := s.mainPolicyID()
-	if mainID == 0 {
-		return nil, fmt.Errorf("series has no main policy")
-	}
-
-	var r dbRecord
-	resr := ts.db.
-		Where("sampling_id = ? AND time <= ?", mainID, t).
-		Order("time desc").
-		Limit(1).
-		Find(&r)
-	if resr.Error != nil {
-		return nil, resr.Error
-	}
-	if resr.RowsAffected == 0 {
-		return nil, fmt.Errorf("record not found")
-	}
-
-	return &Record{
-		Id:     r.Id,
-		Series: series,
-		Time:   r.Time,
-		Value:  r.Value,
-	}, nil
+	return r.Value, true, nil
 }
 
-// ValueAt returns the value of the latest record at or before the given time
-func (ts *Registry) ValueAt(series string, t time.Time) (float64, error) {
-	r, err := ts.RecordAt(series, t)
+// At returns an as-of snapshot: each field's latest value at or before t.
+// The returned Point.Time is the query time t; per-field source timestamps are not kept.
+func (s *Store) At(series string, t time.Time) (Point, error) {
+	sid, err := s.seriesID(series)
 	if err != nil {
-		return 0, err
+		return Point{}, err
 	}
-	return r.Value, nil
+	names, err := s.fieldNames()
+	if err != nil {
+		return Point{}, err
+	}
+
+	// Portable "latest per field <= t": match rows whose time equals the per-field max <= t.
+	var recs []dbRecord
+	err = s.db.Raw(`
+		SELECT r.series_id, r.field_id, r.time, r.value
+		FROM records r
+		WHERE r.series_id = ? AND r.time <= ?
+		  AND r.time = (
+			SELECT MAX(r2.time) FROM records r2
+			WHERE r2.series_id = r.series_id AND r2.field_id = r.field_id AND r2.time <= ?
+		  )
+	`, sid, unixMilli(t), unixMilli(t)).Scan(&recs).Error
+	if err != nil {
+		return Point{}, err
+	}
+
+	out := Point{Time: t, Values: map[string]float64{}}
+	for _, r := range recs {
+		out.Values[names[r.FieldId]] = r.Value
+	}
+	return out, nil
+}
+
+// Delete removes all fields at exactly t for the series.
+func (s *Store) Delete(series string, t time.Time) error {
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return err
+	}
+	return s.db.Where("series_id = ? AND time = ?", sid, unixMilli(t)).Delete(&dbRecord{}).Error
+}
+
+// DeleteRange removes all records in [start, end] for the series.
+func (s *Store) DeleteRange(series string, start, end time.Time) error {
+	sid, err := s.seriesID(series)
+	if err != nil {
+		return err
+	}
+	q := s.db.Where("series_id = ?", sid)
+	if !start.IsZero() {
+		q = q.Where("time >= ?", unixMilli(start))
+	}
+	if !end.IsZero() {
+		q = q.Where("time <= ?", unixMilli(end))
+	}
+	return q.Delete(&dbRecord{}).Error
 }

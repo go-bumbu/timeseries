@@ -1,49 +1,58 @@
 package timeseries
 
 import (
+	"errors"
 	"fmt"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
-// dbField is the global field dimension (the external key).
+// dbField is the per-series field dimension. A field belongs to exactly one
+// series; (series_id, name) is unique. Integrity is application-level (no FK).
 type dbField struct {
 	ID          uint   `gorm:"primaryKey;autoIncrement"`
-	Name        string `gorm:"uniqueIndex;not null;size:64"`
+	SeriesId    uint   `gorm:"not null;uniqueIndex:idx_series_field,priority:1"`
+	Name        string `gorm:"not null;size:64;uniqueIndex:idx_series_field,priority:2"`
 	AggregateFn string `gorm:"not null;size:32"`
 }
 
 func (dbField) TableName() string { return "fields" }
 
-// Field is a globally-defined measurement name with its bucket aggregation.
+// Field is a series-scoped measurement name with its bucket aggregation.
 type Field struct {
 	Name      string
 	Aggregate string // AggLast, AggMax, ...; "" means no bucket reduction
 }
 
-// DefineField creates or updates a field by name. The aggregate name must be
-// empty or previously registered; otherwise it errors.
-func (s *Store) DefineField(f Field) error {
-	if f.Name == "" {
-		return fmt.Errorf("field name cannot be empty")
-	}
-	if f.Aggregate != "" {
-		if _, ok := s.aggregates[f.Aggregate]; !ok {
-			return fmt.Errorf("unknown aggregate %q", f.Aggregate)
+// fieldID resolves a field name within a series to its id; errors if undefined.
+func (s *Store) fieldID(seriesID uint, name string) (uint, error) {
+	var f dbField
+	if err := s.db.Where("series_id = ? AND name = ?", seriesID, name).First(&f).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, fmt.Errorf("field %q is not defined for this series", name)
 		}
+		return 0, err
 	}
-	row := dbField{Name: f.Name, AggregateFn: f.Aggregate}
-	return s.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "name"}},
-		DoUpdates: clause.AssignmentColumns([]string{"aggregate_fn"}),
-	}).Create(&row).Error
+	return f.ID, nil
 }
 
-// ListFields returns all defined fields.
-func (s *Store) ListFields() ([]Field, error) {
+// fieldNames returns an id->name map for one series' fields.
+func (s *Store) fieldNames(seriesID uint) (map[uint]string, error) {
 	var rows []dbField
-	if err := s.db.Order("name ASC").Find(&rows).Error; err != nil {
+	if err := s.db.Where("series_id = ?", seriesID).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	m := make(map[uint]string, len(rows))
+	for _, r := range rows {
+		m[r.ID] = r.Name
+	}
+	return m, nil
+}
+
+// seriesFields returns one series' fields as API values, name-ascending.
+func (s *Store) seriesFields(seriesID uint) ([]Field, error) {
+	var rows []dbField
+	if err := s.db.Where("series_id = ?", seriesID).Order("name ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]Field, len(rows))
@@ -51,16 +60,4 @@ func (s *Store) ListFields() ([]Field, error) {
 		out[i] = Field{Name: r.Name, Aggregate: r.AggregateFn}
 	}
 	return out, nil
-}
-
-// fieldID resolves a field name to its id; errors if undefined.
-func (s *Store) fieldID(name string) (uint, error) {
-	var f dbField
-	if err := s.db.Where("name = ?", name).First(&f).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return 0, fmt.Errorf("field %q is not defined", name)
-		}
-		return 0, err
-	}
-	return f.ID, nil
 }

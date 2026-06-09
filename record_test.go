@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,17 +10,17 @@ import (
 
 func setupAAPL(t *testing.T, s *Store) {
 	t.Helper()
-	if err := s.DefineSeries(Series{Name: "AAPL", Precision: 24 * time.Hour, Retention: 365 * 24 * time.Hour}); err != nil {
+	if err := s.DefineSeries(Series{
+		Name:      "AAPL",
+		Precision: 24 * time.Hour,
+		Retention: 365 * 24 * time.Hour,
+		Fields: []Field{
+			{Name: "open", Aggregate: AggFirst},
+			{Name: "close", Aggregate: AggLast},
+			{Name: "volume", Aggregate: AggSum},
+		},
+	}); err != nil {
 		t.Fatal(err)
-	}
-	for _, f := range []Field{
-		{Name: "open", Aggregate: AggFirst},
-		{Name: "close", Aggregate: AggLast},
-		{Name: "volume", Aggregate: AggSum},
-	} {
-		if err := s.DefineField(f); err != nil {
-			t.Fatal(err)
-		}
 	}
 }
 
@@ -238,6 +239,60 @@ func TestDeletes(t *testing.T) {
 			s.db.Model(&dbRecord{}).Count(&total)
 			if total != 0 {
 				t.Fatalf("after DropSeries cascade count = %d, want 0", total)
+			}
+			var fieldsLeft int64
+			s.db.Model(&dbField{}).Count(&fieldsLeft)
+			if fieldsLeft != 0 {
+				t.Fatalf("after DropSeries field count = %d, want 0 (fields must cascade)", fieldsLeft)
+			}
+		})
+	}
+}
+
+func TestPerSeriesFieldIndependence(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestPerSeriesFieldIndep"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			long := 100 * 365 * 24 * time.Hour
+			if err := s.DefineSeries(Series{
+				Name: "A", Precision: 24 * time.Hour, Retention: long,
+				Fields: []Field{{Name: "v", Aggregate: AggMax}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DefineSeries(Series{
+				Name: "B", Precision: 24 * time.Hour, Retention: long,
+				Fields: []Field{{Name: "v", Aggregate: AggMin}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			write := func(series string) {
+				if err := s.WriteMany(series, []Point{
+					{Time: day.Add(9 * time.Hour), Values: map[string]float64{"v": 10}},
+					{Time: day.Add(16 * time.Hour), Values: map[string]float64{"v": 20}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("A")
+			write("B")
+
+			if err := s.Maintain(context.Background()); err != nil {
+				t.Fatalf("Maintain: %v", err)
+			}
+
+			va, _, _ := s.FieldAt("A", "v", day.Add(24*time.Hour))
+			vb, _, _ := s.FieldAt("B", "v", day.Add(24*time.Hour))
+			if va != 20 {
+				t.Fatalf("A.v = %v, want 20 (max)", va)
+			}
+			if vb != 10 {
+				t.Fatalf("B.v = %v, want 10 (min)", vb)
 			}
 		})
 	}

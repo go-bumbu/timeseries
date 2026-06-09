@@ -7,11 +7,13 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// dbRecord is the clustered fact table: one row per (series, field, time).
+// dbRecord is the clustered fact table: one row per (series, time, field).
+// PK order (series_id, time, field_id) keeps each series contiguous in time,
+// optimal for whole-series pivot reads.
 type dbRecord struct {
 	SeriesId uint      `gorm:"primaryKey;autoIncrement:false"`
-	FieldId  uint      `gorm:"primaryKey;autoIncrement:false"`
 	Time     unixMilli `gorm:"primaryKey;autoIncrement:false"`
+	FieldId  uint      `gorm:"primaryKey;autoIncrement:false"`
 	Value    float64
 }
 
@@ -54,7 +56,7 @@ func (s *Store) WriteMany(series string, ps []Point) error {
 		for name, val := range p.Values {
 			fid, ok := fieldIDs[name]
 			if !ok {
-				fid, err = s.fieldID(name)
+				fid, err = s.fieldID(sid, name)
 				if err != nil {
 					return err
 				}
@@ -78,19 +80,6 @@ func (s *Store) WriteMany(series string, ps []Point) error {
 	}).CreateInBatches(&rows, 500).Error
 }
 
-// fieldNames returns an id->name map for all defined fields.
-func (s *Store) fieldNames() (map[uint]string, error) {
-	var rows []dbField
-	if err := s.db.Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	m := make(map[uint]string, len(rows))
-	for _, r := range rows {
-		m[r.ID] = r.Name
-	}
-	return m, nil
-}
-
 // Range returns points in [start, end], pivoting records that share an exact
 // timestamp into one Point. Returned in ascending time order.
 func (s *Store) Range(series string, start, end time.Time) ([]Point, error) {
@@ -98,7 +87,7 @@ func (s *Store) Range(series string, start, end time.Time) ([]Point, error) {
 	if err != nil {
 		return nil, err
 	}
-	names, err := s.fieldNames()
+	names, err := s.fieldNames(sid)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +123,7 @@ func (s *Store) FieldRange(series, field string, start, end time.Time) ([]Sample
 	if err != nil {
 		return nil, err
 	}
-	fid, err := s.fieldID(field)
+	fid, err := s.fieldID(sid, field)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +151,7 @@ func (s *Store) FieldAt(series, field string, t time.Time) (float64, bool, error
 	if err != nil {
 		return 0, false, err
 	}
-	fid, err := s.fieldID(field)
+	fid, err := s.fieldID(sid, field)
 	if err != nil {
 		return 0, false, err
 	}
@@ -185,7 +174,7 @@ func (s *Store) At(series string, t time.Time) (Point, error) {
 	if err != nil {
 		return Point{}, err
 	}
-	names, err := s.fieldNames()
+	names, err := s.fieldNames(sid)
 	if err != nil {
 		return Point{}, err
 	}

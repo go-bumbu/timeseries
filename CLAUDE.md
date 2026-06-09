@@ -12,24 +12,31 @@ changing storage, the public API, or aggregation.
 ## High-level architecture decisions
 
 - **Field-dimension model (external key).** A point has multiple named **fields**
-  (e.g. open/high/low/close/volume). Field names live in a global `dbField` table and are
-  referenced by integer FK from `dbRecord`. A single-value series is just one field.
+  (e.g. open/high/low/close/volume). Fields are **owned by a series**: `dbField` rows are
+  keyed by `(series_id, name)` (unique within a series) and referenced by integer id from
+  `dbRecord`. The same field name in two series is two independent fields with independent
+  aggregates. A single-value series is just one field.
 - **Storage = one row per `(series, field, time)`.** Composite primary key
-  `(series_id, field_id, time)`; no synthetic ID, no secondary indexes. Ingestion is an
+  `(series_id, time, field_id)`; no synthetic ID, no secondary indexes. Ingestion is an
   idempotent **upsert** on that key.
-- **PK ordering is `(series_id, field_id, time)`** — keeps each field's time-series
-  contiguous (optimal for single-field range scans and per-field reduction).
+- **PK ordering is `(series_id, time, field_id)`** — keeps each series contiguous in time
+  order (optimal for whole-series, multi-field pivot reads, the dominant access pattern).
 - **Time is stored as integer epoch milliseconds** (`INTEGER` on SQLite, `BIGINT`
   elsewhere) via the `unixMilli` custom column type. The public API stays `time.Time`;
   conversion happens only at the storage boundary; values are normalized to UTC.
 - **`WITHOUT ROWID` on SQLite only** to cluster rows on the PK. MySQL/InnoDB clusters on
   the PK automatically; PostgreSQL relies on the PK index. Always gate SQLite-specific
   tuning behind `db.Dialector.Name() == "sqlite"`.
-- **Aggregation is per-field** (`Field.Aggregate`: avg/sum/min/max/first/last/custom), not
-  per-series. The `dbSamplingPolicy` table and the multi-policy concept are **removed**;
-  precision + retention now live on `Series`, aggregation on `Field`.
-- **Public API:** `Store` (was `Registry`) with `Series`, `Field`, `Point{Time,Values}`,
-  `Sample{Time,Value}`. Identity is `(series, field, time)` — no record IDs.
+- **Aggregation is per-field, and fields are per-series** (`Field.Aggregate`:
+  avg/sum/min/max/first/last/custom). The `dbSamplingPolicy` table and the multi-policy
+  concept are **removed**; precision + retention live on `Series`, aggregation on `Field`.
+- **Fields are declared inside `DefineSeries`** via `Series.Fields` and synced
+  **declaratively**: a field absent from `Series.Fields` on a re-`DefineSeries` is deleted
+  (cascading its records); new fields are created; aggregates are updated. There is **no**
+  standalone `DefineField`/`ListFields`.
+- **Public API:** `Store` (was `Registry`) with `Series{...,Fields []Field}`, `Field`,
+  `Point{Time,Values}`, `Sample{Time,Value}`. Identity is `(series, field, time)` — no
+  record IDs.
 
 ## Caveats / gotchas
 
@@ -46,11 +53,14 @@ changing storage, the public API, or aggregation.
 - **Bucket reduction only runs in `Maintain`, only when >1 raw point shares a precision
   bucket.** For daily EOD with daily precision it never fires; reads may see sub-bucket
   points between maintenance runs.
-- **Integrity is application-level, not DB foreign keys.** There are no FK constraints
-  on `records`. `Write`/`WriteMany` resolve (and validate) series/field names before
-  insert, and `DropSeries` deletes a series' records then the series in one transaction
-  (emulating cascade). There is no `DropField`. This holds as long as all writes go
-  through the `Store` API; it does not protect against out-of-band writers.
+- **Integrity is application-level, not DB foreign keys.** There are no FK constraints on
+  `records` (required by the multi-DB constraint). `Write`/`WriteMany` resolve (and
+  validate) series/field names before insert. `DropSeries` deletes a series' records, then
+  its fields, then the series row in one transaction. `DefineSeries`'s declarative sync
+  removes absent fields and cascades their records in the same transaction — i.e.
+  application-level field deletion exists (there is no public `DropField`). This holds as
+  long as all writes go through the `Store` API; it does not protect against out-of-band
+  writers.
 - **Multi-DB is a hard requirement.** All behavioral tests must run across the
   `testdbs.DBs()` matrix; never assume SQLite-only behavior outside gated tuning.
 

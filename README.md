@@ -32,9 +32,15 @@ if err != nil {
 	return
 }
 
-_ = ts.DefineSeries(timeseries.Series{Name: "AAPL", Precision: 24 * time.Hour, Retention: 10 * 365 * 24 * time.Hour})
-_ = ts.DefineField(timeseries.Field{Name: "close", Aggregate: timeseries.AggLast})
-_ = ts.DefineField(timeseries.Field{Name: "high", Aggregate: timeseries.AggMax})
+_ = ts.DefineSeries(timeseries.Series{
+	Name:      "AAPL",
+	Precision: 24 * time.Hour,
+	Retention: 10 * 365 * 24 * time.Hour,
+	Fields: []timeseries.Field{
+		{Name: "close", Aggregate: timeseries.AggLast},
+		{Name: "high", Aggregate: timeseries.AggMax},
+	},
+})
 
 day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
 _ = ts.Write("AAPL", timeseries.Point{Time: day, Values: map[string]float64{"close": 102.1, "high": 103.0}})
@@ -59,34 +65,38 @@ func New(db *gorm.DB) (*Store, error)
 
 ### Series
 
-A `Series` is a named stream with its own precision and retention:
+A `Series` is a named stream with its own precision, retention, and fields:
 
 ```go
 type Series struct {
 	Name      string
 	Precision time.Duration // bucket size, minimum 1 second
 	Retention time.Duration // how long data is kept
+	Fields    []Field       // the fields this series carries
 }
 
-func (s *Store) DefineSeries(cfg Series) error   // create or update by name
+func (s *Store) DefineSeries(cfg Series) error   // create or update by name; syncs fields
 func (s *Store) GetSeries(name string) (Series, error)
 func (s *Store) ListSeries() ([]Series, error)
-func (s *Store) DropSeries(name string) error    // removes the series and all its records
+func (s *Store) DropSeries(name string) error    // removes the series, its fields, and all its records
 ```
+
+`DefineSeries` syncs the series' fields **declaratively**: `cfg.Fields` is the complete
+desired set. Fields present in the store but absent from `cfg.Fields` are removed and
+their records deleted; new fields are created; existing fields' aggregates are updated.
 
 ### Fields
 
-A `Field` is a globally-defined measurement name plus the aggregate used when reducing a
-precision bucket. Fields are shared across all series.
+A `Field` is a series-scoped measurement name plus the aggregate used when reducing a
+precision bucket. Each series owns its fields, so the same name (e.g. `close`) in two
+series is two independent fields with independent aggregates. Fields are declared inside
+`DefineSeries` (above) — there is no standalone field API.
 
 ```go
 type Field struct {
 	Name      string
 	Aggregate string // one of the Agg* constants, or "" for no bucket reduction
 }
-
-func (s *Store) DefineField(f Field) error // create or update by name
-func (s *Store) ListFields() ([]Field, error)
 ```
 
 The aggregate names are constants:
@@ -101,7 +111,7 @@ The aggregate names are constants:
 | `AggLast`   | latest value in the bucket         |
 | `""`        | no reduction (raw rows are kept)   |
 
-`DefineField` errors if the aggregate name is non-empty and has not been registered.
+`DefineSeries` errors if any field's aggregate name is non-empty and has not been registered.
 
 ### Custom aggregates
 
@@ -117,7 +127,12 @@ meaningful:
 
 ```go
 ts.RegisterAggregate("range", func(v []float64) float64 { return v[len(v)-1] - v[0] })
-_ = ts.DefineField(timeseries.Field{Name: "spread", Aggregate: "range"})
+_ = ts.DefineSeries(timeseries.Series{
+	Name:      "AAPL",
+	Precision: 24 * time.Hour,
+	Retention: 10 * 365 * 24 * time.Hour,
+	Fields:    []timeseries.Field{{Name: "spread", Aggregate: "range"}},
+})
 ```
 
 ### Writing

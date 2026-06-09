@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-bumbu/testdbs"
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestDefineSeries(t *testing.T) {
@@ -15,7 +16,10 @@ func TestDefineSeries(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			cfg := Series{Name: "AAPL", Precision: 24 * time.Hour, Retention: 30 * 24 * time.Hour}
+			cfg := Series{
+				Name: "AAPL", Precision: 24 * time.Hour, Retention: 30 * 24 * time.Hour,
+				Fields: []Field{{Name: "close", Aggregate: AggLast}},
+			}
 			if err := s.DefineSeries(cfg); err != nil {
 				t.Fatalf("DefineSeries: %v", err)
 			}
@@ -24,8 +28,8 @@ func TestDefineSeries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != cfg {
-				t.Fatalf("GetSeries = %+v, want %+v", got, cfg)
+			if diff := cmp.Diff(cfg, got); diff != "" {
+				t.Fatalf("GetSeries mismatch (-want +got):\n%s", diff)
 			}
 
 			list, err := s.ListSeries()

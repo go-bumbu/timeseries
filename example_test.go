@@ -19,9 +19,15 @@ func ExampleStore() {
 		return
 	}
 
-	_ = ts.DefineSeries(timeseries.Series{Name: "AAPL", Precision: 24 * time.Hour, Retention: 10 * 365 * 24 * time.Hour})
-	_ = ts.DefineField(timeseries.Field{Name: "close", Aggregate: timeseries.AggLast})
-	_ = ts.DefineField(timeseries.Field{Name: "high", Aggregate: timeseries.AggMax})
+	_ = ts.DefineSeries(timeseries.Series{
+		Name:      "AAPL",
+		Precision: 24 * time.Hour,
+		Retention: 10 * 365 * 24 * time.Hour,
+		Fields: []timeseries.Field{
+			{Name: "close", Aggregate: timeseries.AggLast},
+			{Name: "high", Aggregate: timeseries.AggMax},
+		},
+	})
 
 	day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
 	_ = ts.Write("AAPL", timeseries.Point{Time: day, Values: map[string]float64{"close": 102.1, "high": 103.0}})

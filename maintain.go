@@ -38,37 +38,34 @@ func (s *Store) cleanRetention(ctx context.Context, ser dbSeries) error {
 		Delete(&dbRecord{}).Error
 }
 
-// reduceSeries collapses multi-record precision buckets per field using the
-// field's aggregate function.
+// reduceSeries collapses multi-record precision buckets for a whole series in a
+// single time-ordered pass, applying each field's aggregate. Fields with an
+// empty aggregate are left untouched.
 func (s *Store) reduceSeries(ctx context.Context, ser dbSeries) error {
 	var fields []dbField
-	if err := s.db.WithContext(ctx).Find(&fields).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("series_id = ?", ser.ID).Find(&fields).Error; err != nil {
 		return err
 	}
+	aggByField := map[uint]AggregateFn{}
 	for _, f := range fields {
 		if f.AggregateFn == "" {
 			continue
 		}
-		fn, ok := s.aggregates[f.AggregateFn]
-		if !ok {
-			continue // unknown aggregate: skip (validated at DefineField, defensive here)
-		}
-		if err := s.reduceField(ctx, ser, f, fn); err != nil {
-			return err
+		if fn, ok := s.aggregates[f.AggregateFn]; ok {
+			aggByField[f.ID] = fn
 		}
 	}
-	return nil
-}
+	if len(aggByField) == 0 {
+		return nil // nothing reducible
+	}
 
-func (s *Store) reduceField(ctx context.Context, ser dbSeries, f dbField, fn AggregateFn) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Overall time span for the series.
 		var minRec, maxRec dbRecord
-		if err := tx.Where("series_id = ? AND field_id = ?", ser.ID, f.ID).
-			Order("time ASC").Limit(1).Find(&minRec).Error; err != nil {
+		if err := tx.Where("series_id = ?", ser.ID).Order("time ASC").Limit(1).Find(&minRec).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("series_id = ? AND field_id = ?", ser.ID, f.ID).
-			Order("time DESC").Limit(1).Find(&maxRec).Error; err != nil {
+		if err := tx.Where("series_id = ?", ser.ID).Order("time DESC").Limit(1).Find(&maxRec).Error; err != nil {
 			return err
 		}
 		if minRec.Time.asTime().IsZero() {
@@ -80,7 +77,7 @@ func (s *Store) reduceField(ctx context.Context, ser dbSeries, f dbField, fn Agg
 		maxTime := maxRec.Time.asTime()
 		for !bucket.After(maxTime) {
 			chunkEnd := bucket.Add(precision * reduceChunkBuckets)
-			if err := s.reduceChunk(tx, ser.ID, f.ID, bucket, chunkEnd, precision, fn); err != nil {
+			if err := s.reduceSeriesChunk(tx, ser.ID, bucket, chunkEnd, precision, aggByField); err != nil {
 				return err
 			}
 			bucket = chunkEnd
@@ -89,49 +86,49 @@ func (s *Store) reduceField(ctx context.Context, ser dbSeries, f dbField, fn Agg
 	})
 }
 
-func (s *Store) reduceChunk(tx *gorm.DB, seriesID, fieldID uint, start, end time.Time, precision time.Duration, fn AggregateFn) error {
+// reduceSeriesChunk reduces one bucket-aligned chunk [start, end) for all
+// reducible fields of a series. Buckets never span chunk boundaries because the
+// chunk size is a whole multiple of precision.
+func (s *Store) reduceSeriesChunk(tx *gorm.DB, seriesID uint, start, end time.Time, precision time.Duration, aggByField map[uint]AggregateFn) error {
 	var recs []dbRecord
-	if err := tx.Where("series_id = ? AND field_id = ? AND time >= ? AND time < ?",
-		seriesID, fieldID, unixMilli(start), unixMilli(end)).
+	if err := tx.Where("series_id = ? AND time >= ? AND time < ?",
+		seriesID, unixMilli(start), unixMilli(end)).
 		Order("time ASC").Find(&recs).Error; err != nil {
 		return err
 	}
 
-	type group struct {
-		recs []dbRecord
+	type key struct {
+		field  uint
+		bucket time.Time
 	}
-	buckets := map[time.Time]*group{}
-	var order []time.Time
+	groups := map[key][]float64{}
+	var order []key
 	for _, r := range recs {
-		b := r.Time.asTime().Truncate(precision)
-		if buckets[b] == nil {
-			buckets[b] = &group{}
-			order = append(order, b)
+		if _, ok := aggByField[r.FieldId]; !ok {
+			continue // field has no aggregate: leave its rows untouched
 		}
-		buckets[b].recs = append(buckets[b].recs, r)
+		k := key{field: r.FieldId, bucket: r.Time.asTime().Truncate(precision)}
+		if _, seen := groups[k]; !seen {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], r.Value) // recs are time-ascending: aggregate contract holds
 	}
 
-	for _, b := range order {
-		g := buckets[b]
-		if len(g.recs) < 2 {
+	for _, k := range order {
+		vals := groups[k]
+		if len(vals) < 2 {
 			continue // already one row in the bucket
 		}
-		vals := make([]float64, len(g.recs))
-		for i, r := range g.recs {
-			vals[i] = r.Value // recs are time-ascending: the aggregate contract holds
-		}
-		reduced := fn(vals)
-
-		// Delete every raw row in the bucket, then write one row at the bucket start.
+		reduced := aggByField[k.field](vals)
 		if err := tx.Where("series_id = ? AND field_id = ? AND time >= ? AND time < ?",
-			seriesID, fieldID, unixMilli(b), unixMilli(b.Add(precision))).
+			seriesID, k.field, unixMilli(k.bucket), unixMilli(k.bucket.Add(precision))).
 			Delete(&dbRecord{}).Error; err != nil {
 			return err
 		}
 		if err := tx.Create(&dbRecord{
 			SeriesId: seriesID,
-			FieldId:  fieldID,
-			Time:     unixMilli(b),
+			FieldId:  k.field,
+			Time:     unixMilli(k.bucket),
 			Value:    reduced,
 		}).Error; err != nil {
 			return err

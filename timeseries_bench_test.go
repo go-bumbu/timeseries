@@ -41,10 +41,10 @@ func TestTiming(t *testing.T) {
 					t.Fatal(err)
 				}
 				base := time.Now().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
-				if err := s.DefineSeries(Series{Name: "ts", Precision: time.Hour, Retention: 365 * 24 * time.Hour}); err != nil {
-					t.Fatal(err)
-				}
-				if err := s.DefineField(Field{Name: "v", Aggregate: AggAvg}); err != nil {
+				if err := s.DefineSeries(Series{
+					Name: "ts", Precision: time.Hour, Retention: 365 * 24 * time.Hour,
+					Fields: []Field{{Name: "v", Aggregate: AggAvg}},
+				}); err != nil {
 					t.Fatal(err)
 				}
 
@@ -84,10 +84,10 @@ func TestStorageFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DefineSeries(Series{Name: "fp", Precision: 24 * time.Hour, Retention: 100 * 365 * 24 * time.Hour}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.DefineField(Field{Name: "v", Aggregate: ""}); err != nil {
+	if err := s.DefineSeries(Series{
+		Name: "fp", Precision: 24 * time.Hour, Retention: 100 * 365 * 24 * time.Hour,
+		Fields: []Field{{Name: "v", Aggregate: ""}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 

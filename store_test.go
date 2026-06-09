@@ -3,6 +3,7 @@ package timeseries
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -115,78 +116,152 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
-// TestConcurrentAccess exercises the Store's internal serialization: many
-// readers and writers run alongside DefineSeries and Maintain on the same
-// Store. It must not deadlock or trip the race detector, and every operation
-// against the live series must succeed. Run with -race for full value.
+// TestConcurrentAccess exercises the Store's internal serialization under real
+// contention: stable-field writers, a writer of a field that is repeatedly
+// dropped and re-added, readers, a definer that toggles that field (cascading
+// its records), and a maintainer all run on one Store. It then asserts the
+// data invariants the lock exists to protect — no orphan records survive a
+// concurrent field-drop, and reduction is consistent — not merely that nothing
+// errored. Run with -race for full value.
+//
+// Pinned to the SQLite backend with a single connection: this isolates the
+// Go-level lock discipline from driver busy-retry semantics. Concurrent-write
+// behavior on PostgreSQL/MySQL is not exercised here.
 func TestConcurrentAccess(t *testing.T) {
 	s, err := New(testdbs.DBs()[0].ConnDbName("TestConcurrent"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Serialize at the driver so concurrent SQLite writers don't hit SQLITE_BUSY;
-	// the point of this test is our locking discipline, not driver concurrency.
 	if sqlDB, err := s.db.DB(); err == nil {
 		sqlDB.SetMaxOpenConns(1)
 	}
 	ctx := context.Background()
-	def := Series{
-		Name: "C", Precision: time.Hour, Retention: 100 * 365 * 24 * time.Hour,
-		Fields: []Field{{Name: "v", Aggregate: AggMax}},
-	}
-	if err := s.DefineSeries(ctx, def); err != nil {
+	const long = 100 * 365 * 24 * time.Hour
+	// defWith carries an extra "tmp" field; defWithout drops it (cascading its
+	// records). The definer toggles between the two, so a writer resolving
+	// "tmp" can race the cascade — the exact orphan-record window the lock closes.
+	defWith := Series{Name: "C", Precision: time.Hour, Retention: long,
+		Fields: []Field{{Name: "v", Aggregate: AggMax}, {Name: "tmp", Aggregate: AggMax}}}
+	defWithout := Series{Name: "C", Precision: time.Hour, Retention: long,
+		Fields: []Field{{Name: "v", Aggregate: AggMax}}}
+	if err := s.DefineSeries(ctx, defWith); err != nil {
 		t.Fatal(err)
 	}
 	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	const iters = 50
-	errCh := make(chan error, 8)
+	var errs []error
+	var errMu sync.Mutex
 	report := func(err error) {
-		if err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
+		if err == nil {
+			return
 		}
+		errMu.Lock()
+		errs = append(errs, err)
+		errMu.Unlock()
 	}
 
 	var wg sync.WaitGroup
-	// writers
-	for w := 0; w < 3; w++ {
+	// stable-field writers: "v" always exists, so these must always succeed.
+	for w := 0; w < 2; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				ts := base.Add(time.Duration(w*iters+i) * time.Minute)
+				ts := base.Add(time.Duration(w*1000+i) * time.Minute)
 				report(s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"v": float64(i)}}))
 			}
 		}(w)
 	}
-	// readers
-	for r := 0; r < 3; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < iters; i++ {
-				if _, err := s.Range(ctx, "C", time.Time{}, time.Time{}); err != nil {
-					report(err)
-				}
-			}
-		}()
-	}
-	// a structural worker: redefines (keeping the field) and maintains
+	// dropped-field writer: "tmp" may be absent, so ErrFieldNotFound is a
+	// legitimate outcome of the race and is tolerated; anything else is a bug.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			report(s.DefineSeries(ctx, def))
+			ts := base.Add(time.Duration(5000+i) * time.Minute)
+			err := s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"tmp": float64(i)}})
+			if err != nil && !errors.Is(err, ErrFieldNotFound) {
+				report(err)
+			}
+		}
+	}()
+	// readers: a pivoted Point must never contain an orphan (empty-name) field,
+	// which is exactly what a record pointing at a dropped field id would yield.
+	for r := 0; r < 2; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				pts, err := s.Range(ctx, "C", time.Time{}, time.Time{})
+				if err != nil {
+					report(err)
+					continue
+				}
+				for _, p := range pts {
+					if _, orphan := p.Values[""]; orphan {
+						report(fmt.Errorf("orphan record observed: %+v", p.Values))
+					}
+				}
+			}
+		}()
+	}
+	// definer toggles the "tmp" field; maintainer reduces concurrently.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if i%2 == 0 {
+				report(s.DefineSeries(ctx, defWithout))
+			} else {
+				report(s.DefineSeries(ctx, defWith))
+			}
 			report(s.Maintain(ctx))
 		}
 	}()
 
 	wg.Wait()
-	close(errCh)
-	if err := <-errCh; err != nil {
-		t.Fatalf("concurrent operation failed: %v", err)
+	if len(errs) > 0 {
+		t.Fatalf("concurrent operations failed (%d): %v", len(errs), errs)
+	}
+
+	// Settle to a known schema (drops "tmp" and its records) and reduce.
+	if err := s.DefineSeries(ctx, defWithout); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// No orphan records: every surviving record's field resolves to a live name.
+	pts, err := s.Range(ctx, "C", time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pts) == 0 {
+		t.Fatal("expected surviving points for field v")
+	}
+	for _, p := range pts {
+		if _, orphan := p.Values[""]; orphan {
+			t.Fatalf("orphan record survived settle: %+v", p.Values)
+		}
+		if _, ok := p.Values["tmp"]; ok {
+			t.Fatalf("dropped field tmp still present after settle: %+v", p.Values)
+		}
+	}
+
+	// Reduction is settled: a second Maintain changes nothing (idempotent).
+	var before, after int64
+	if err := s.db.Model(&dbRecord{}).Count(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&dbRecord{}).Count(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("Maintain not idempotent after settle: %d -> %d rows", before, after)
 	}
 }

@@ -128,7 +128,7 @@ meaningful:
 
 ```go
 ts.RegisterAggregate("range", func(v []float64) float64 { return v[len(v)-1] - v[0] })
-_ = ts.DefineSeries(timeseries.Series{
+_ = ts.DefineSeries(ctx, timeseries.Series{
 	Name:      "AAPL",
 	Precision: 24 * time.Hour,
 	Retention: 10 * 365 * 24 * time.Hour,

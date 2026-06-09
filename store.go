@@ -36,6 +36,13 @@ type Store struct {
 }
 
 // New migrates the schema and returns a Store with the built-in aggregates registered.
+//
+// New runs AutoMigrate on every call. Treat the returned Store as the single
+// owner of its database: the serialization that protects against the
+// orphan-record and reduce-window races is in-process only (see the Store doc
+// comment), so a second Store — in this process or another — pointed at the same
+// database can still cause silent data loss during Maintain. Run one Store per
+// database.
 func New(db *gorm.DB) (*Store, error) {
 	if db == nil {
 		return nil, errors.New("timeseries: db must not be nil")
@@ -75,6 +82,14 @@ const (
 func (s *Store) RegisterAggregate(name string, fn AggregateFn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.register(name, fn)
+}
+
+// register stores an aggregate without locking. Callers must hold s.mu, or be
+// constructing the Store before it is shared (as registerBuiltins does). The
+// RWMutex is not reentrant, so never call this — or registerBuiltins — from a
+// path that already holds the lock via the exported RegisterAggregate.
+func (s *Store) register(name string, fn AggregateFn) {
 	if s.aggregates == nil {
 		s.aggregates = make(map[string]AggregateFn)
 	}
@@ -82,12 +97,12 @@ func (s *Store) RegisterAggregate(name string, fn AggregateFn) {
 }
 
 func (s *Store) registerBuiltins() {
-	s.RegisterAggregate(AggAvg, aggAvg)
-	s.RegisterAggregate(AggSum, aggSum)
-	s.RegisterAggregate(AggMin, aggMin)
-	s.RegisterAggregate(AggMax, aggMax)
-	s.RegisterAggregate(AggFirst, aggFirst)
-	s.RegisterAggregate(AggLast, aggLast)
+	s.register(AggAvg, aggAvg)
+	s.register(AggSum, aggSum)
+	s.register(AggMin, aggMin)
+	s.register(AggMax, aggMax)
+	s.register(AggFirst, aggFirst)
+	s.register(AggLast, aggLast)
 }
 
 // All built-ins are only ever called with a non-empty slice (the reducer guarantees it).

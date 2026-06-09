@@ -68,7 +68,9 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 	})
 }
 
-// validateFields checks field names are non-empty, unique, and use known aggregates.
+// validateFields checks field names are non-empty, unique, and use known
+// aggregates. It reads s.aggregates without locking, so callers must hold s.mu
+// (DefineSeries does). Do not call it outside the lock.
 func (s *Store) validateFields(fields []Field) error {
 	seen := map[string]bool{}
 	for _, f := range fields {

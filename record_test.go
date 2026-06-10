@@ -124,6 +124,126 @@ func TestMove_ZeroTime(t *testing.T) {
 	}
 }
 
+// TestLatest returns the point at the series' maximum timestamp with its real
+// time preserved, and reports found=false for an existing-but-empty series.
+func TestLatest(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestLatest"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			// Empty series: found=false, no error.
+			if _, found, err := s.Latest(ctx, "AAPL"); err != nil || found {
+				t.Fatalf("Latest on empty series: found=%v err=%v, want found=false nil", found, err)
+			}
+
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"open": 100, "close": 101, "volume": 1000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}}); err != nil {
+				t.Fatal(err)
+			}
+
+			p, found, err := s.Latest(ctx, "AAPL")
+			if err != nil || !found {
+				t.Fatalf("Latest: found=%v err=%v, want true nil", found, err)
+			}
+			if !p.Time.Equal(day2) {
+				t.Fatalf("Latest time = %v, want %v (real timestamp, not query time)", p.Time, day2)
+			}
+			if p.Values["close"] != 202 || p.Values["open"] != 200 {
+				t.Fatalf("Latest values = %v, want open=200 close=202", p.Values)
+			}
+
+			// Unknown series propagates ErrSeriesNotFound.
+			if _, _, err := s.Latest(ctx, "NOPE"); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("Latest on unknown series err = %v, want ErrSeriesNotFound", err)
+			}
+		})
+	}
+}
+
+// TestLatestField returns the newest (time, value) for one field, with the real
+// timestamp, and found=false when the field has no samples.
+func TestLatestField(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestLatestField"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			if _, found, err := s.LatestField(ctx, "AAPL", "close"); err != nil || found {
+				t.Fatalf("LatestField on empty series: found=%v err=%v, want false nil", found, err)
+			}
+
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"close": 101}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"close": 202}}); err != nil {
+				t.Fatal(err)
+			}
+
+			sm, found, err := s.LatestField(ctx, "AAPL", "close")
+			if err != nil || !found {
+				t.Fatalf("LatestField: found=%v err=%v, want true nil", found, err)
+			}
+			if !sm.Time.Equal(day2) || sm.Value != 202 {
+				t.Fatalf("LatestField = {%v, %v}, want {%v, 202}", sm.Time, sm.Value, day2)
+			}
+
+			if _, _, err := s.LatestField(ctx, "AAPL", "nope"); !errors.Is(err, ErrFieldNotFound) {
+				t.Fatalf("LatestField unknown field err = %v, want ErrFieldNotFound", err)
+			}
+		})
+	}
+}
+
+// TestCount returns the number of distinct timestamps (points) in a series,
+// independent of how many fields each point carries.
+func TestCount(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestCount"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			if n, err := s.Count(ctx, "AAPL"); err != nil || n != 0 {
+				t.Fatalf("Count on empty series = %d, %v, want 0 nil", n, err)
+			}
+
+			// 3 points, each with multiple fields: count is 3 (distinct timestamps),
+			// not 3*fields rows.
+			for i := 0; i < 3; i++ {
+				day := time.Date(2025, 1, 2+i, 0, 0, 0, 0, time.UTC)
+				if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"open": 1, "close": 2, "volume": 3}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			n, err := s.Count(ctx, "AAPL")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != 3 {
+				t.Fatalf("Count = %d, want 3 (distinct timestamps)", n)
+			}
+		})
+	}
+}
+
 func TestWrite_Errors(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {

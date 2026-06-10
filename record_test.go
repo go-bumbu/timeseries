@@ -66,6 +66,64 @@ func TestWrite_Upsert(t *testing.T) {
 	}
 }
 
+// TestMove_Relocate verifies Move deletes the record at oldTime and upserts the
+// new point at its time in one shot — relocating a record to a new timestamp,
+// with possibly changed values, and leaving nothing behind at the old time.
+func TestMove_Relocate(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestMoveRelocate"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"open": 100, "close": 101, "volume": 1000}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Move to day2 with new values.
+			if err := s.Move(ctx, "AAPL", day1, Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}}); err != nil {
+				t.Fatalf("Move: %v", err)
+			}
+
+			pts, err := s.Range(ctx, "AAPL", time.Time{}, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pts) != 1 {
+				t.Fatalf("after Move: %d points, want 1 (old time must be gone)", len(pts))
+			}
+			if !pts[0].Time.Equal(day2) {
+				t.Fatalf("after Move: point at %v, want %v", pts[0].Time, day2)
+			}
+			if pts[0].Values["close"] != 202 || pts[0].Values["open"] != 200 {
+				t.Fatalf("after Move: values = %v, want open=200 close=202", pts[0].Values)
+			}
+		})
+	}
+}
+
+// TestMove_ZeroTime rejects a new point with a zero timestamp, mirroring Write.
+func TestMove_ZeroTime(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestMoveZeroTime"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			if err := s.Move(ctx, "AAPL", day1, Point{Values: map[string]float64{"close": 1}}); err == nil {
+				t.Fatal("Move with zero point time should error")
+			}
+		})
+	}
+}
+
 func TestWrite_Errors(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {

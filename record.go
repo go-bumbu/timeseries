@@ -92,6 +92,53 @@ func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error 
 	})
 }
 
+// Move atomically replaces the record at oldTime with p: it deletes every field
+// stored at oldTime and upserts p (at p.Time) inside a single transaction, so a
+// crash can never leave the old timestamp removed without the new one written —
+// the hazard a separate Delete + Write pair has. When oldTime equals p.Time it
+// is a clean replace at that timestamp. A zero oldTime skips the delete, making
+// it a plain upsert. Like Write, it takes the shared lock and rejects a zero
+// p.Time.
+func (s *Store) Move(ctx context.Context, series string, oldTime time.Time, p Point) error {
+	if p.Time.IsZero() {
+		return fmt.Errorf("point time cannot be zero")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sid, err := s.seriesID(ctx, series)
+	if err != nil {
+		return err
+	}
+
+	// Resolve and validate every field id before opening the transaction, so an
+	// unknown field aborts without having deleted anything.
+	rows := make([]dbRecord, 0, len(p.Values))
+	for name, val := range p.Values {
+		fid, err := s.fieldID(ctx, sid, name)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, dbRecord{SeriesID: sid, FieldID: fid, Time: unixMilli(p.Time), Value: val})
+	}
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if !oldTime.IsZero() {
+			if err := tx.Where("series_id = ? AND time = ?", sid, unixMilli(oldTime)).Delete(&dbRecord{}).Error; err != nil {
+				return err
+			}
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		// Conflict columns in PK order, matching WriteMany.
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "series_id"}, {Name: "time"}, {Name: "field_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value"}),
+		}).CreateInBatches(&rows, 500).Error
+	})
+}
+
 // Range returns points in [start, end], pivoting records that share an exact
 // timestamp into one Point. Returned in ascending time order. Pass a zero
 // time.Time for an unbounded start or end.

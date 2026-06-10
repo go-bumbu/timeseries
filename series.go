@@ -216,6 +216,25 @@ func (s *Store) DropSeries(ctx context.Context, name string) error {
 	})
 }
 
+// Wipe removes every record, field, and series in one transaction under the
+// exclusive lock — the bulk equivalent of DropSeries for all series at once.
+// Deletes go through the model types, so the table names stay tied to their
+// TableName methods rather than being hardcoded by callers.
+func (s *Store) Wipe(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Order mirrors DropSeries: records reference fields, fields reference series.
+		if err := tx.Where("1 = 1").Delete(&dbRecord{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&dbField{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("1 = 1").Delete(&dbSeries{}).Error
+	})
+}
+
 // seriesID resolves a series name to its id; errors if undefined.
 func (s *Store) seriesID(ctx context.Context, name string) (uint, error) {
 	var row dbSeries

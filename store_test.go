@@ -51,6 +51,58 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
+// TestWipe verifies that Wipe removes every series, field, and record across
+// all series in one shot, leaving the three tables empty.
+func TestWipe(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestWipe"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+			if err := s.DefineSeries(ctx, Series{
+				Name:      "MSFT",
+				Precision: 24 * time.Hour,
+				Retention: 365 * 24 * time.Hour,
+				Fields:    []Field{{Name: "close", Aggregate: AggLast}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"open": 1, "close": 2, "volume": 3}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "MSFT", Point{Time: day, Values: map[string]float64{"close": 9}}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := s.Wipe(ctx); err != nil {
+				t.Fatalf("Wipe: %v", err)
+			}
+
+			for _, model := range []interface{}{&dbRecord{}, &dbField{}, &dbSeries{}} {
+				var count int64
+				if err := s.db.Model(model).Count(&count).Error; err != nil {
+					t.Fatal(err)
+				}
+				if count != 0 {
+					t.Fatalf("after Wipe: %T count = %d, want 0", model, count)
+				}
+			}
+
+			series, err := s.ListSeries(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(series) != 0 {
+				t.Fatalf("after Wipe: ListSeries returned %d, want 0", len(series))
+			}
+		})
+	}
+}
+
 func TestBuiltinAggregates(t *testing.T) {
 	in := []float64{3, 1, 4, 1, 5} // ascending time order, by contract
 	cases := map[string]struct {

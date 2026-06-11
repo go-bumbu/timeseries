@@ -51,6 +51,81 @@ func TestDefineSeries(t *testing.T) {
 	}
 }
 
+// TestDefineSeries_UnchangedSkipsWriteLock asserts that redefining a series
+// with an identical definition is a no-op that takes only the read lock — it
+// must not block on the exclusive lock. The test holds the read lock and
+// requires the redundant DefineSeries to still complete: an exclusive-lock
+// acquisition would deadlock against the held RLock and time out.
+func TestDefineSeries_UnchangedSkipsWriteLock(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestDefineSeriesUnchanged"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			cfg := Series{
+				Name: "AAPL", Precision: 24 * time.Hour, Retention: 30 * 24 * time.Hour,
+				Fields: []Field{{Name: "close", Aggregate: AggLast}, {Name: "volume", Aggregate: AggSum}},
+			}
+			if err := s.DefineSeries(ctx, cfg); err != nil {
+				t.Fatalf("DefineSeries: %v", err)
+			}
+
+			// Hold the read lock: a redundant define must not need the write lock.
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			done := make(chan error, 1)
+			go func() { done <- s.DefineSeries(ctx, cfg) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("redundant DefineSeries: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("redundant DefineSeries blocked on the exclusive lock")
+			}
+		})
+	}
+}
+
+// TestDefineSeries_ChangeStillApplies guards the escalation path: when the
+// requested definition differs from what is stored (retention, field set), the
+// full define-and-reconcile must still run.
+func TestDefineSeries_ChangeStillApplies(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestDefineSeriesChange"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if err := s.DefineSeries(ctx, Series{
+				Name: "AAPL", Precision: 24 * time.Hour, Retention: 30 * 24 * time.Hour,
+				Fields: []Field{{Name: "close", Aggregate: AggLast}},
+			}); err != nil {
+				t.Fatalf("DefineSeries: %v", err)
+			}
+
+			// Change retention and add a field.
+			changed := Series{
+				Name: "AAPL", Precision: 24 * time.Hour, Retention: 60 * 24 * time.Hour,
+				Fields: []Field{{Name: "close", Aggregate: AggLast}, {Name: "volume", Aggregate: AggSum}},
+			}
+			if err := s.DefineSeries(ctx, changed); err != nil {
+				t.Fatalf("DefineSeries (change): %v", err)
+			}
+			got, err := s.GetSeries(ctx, "AAPL")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(changed, got); diff != "" {
+				t.Fatalf("GetSeries mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestDefineSeries_Validation(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {

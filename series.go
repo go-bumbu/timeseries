@@ -33,9 +33,16 @@ type Series struct {
 // new fields are created, and existing fields' aggregates are updated. All in
 // one transaction.
 //
-// DefineSeries takes the Store lock exclusively: it cannot run concurrently
-// with writes, reads, or Maintain on the same Store, which is what keeps a
-// field deletion from racing a concurrent write into orphan records.
+// When the stored definition already matches cfg exactly, DefineSeries is a
+// no-op that takes only the read lock — it neither acquires the exclusive lock
+// nor opens a write transaction. This keeps the common auto-register-before-
+// write pattern cheap. Only an actual change (new series, or differing
+// precision/retention/fields) escalates to the exclusive define-and-reconcile.
+//
+// On that escalation path DefineSeries takes the Store lock exclusively: it
+// cannot run concurrently with writes, reads, or Maintain on the same Store,
+// which is what keeps a field deletion from racing a concurrent write into
+// orphan records.
 func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("series name cannot be empty")
@@ -45,6 +52,16 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 	}
 	if cfg.Precision < time.Second {
 		return fmt.Errorf("precision must be at least 1 second, got %v", cfg.Precision)
+	}
+	// Fast path: a define identical to what is already stored changes nothing,
+	// so resolve it under the read lock and return without the exclusive lock or
+	// a write transaction. Invalid configs (duplicate field names, unknown
+	// aggregates) cannot match a stored definition, so they fall through to the
+	// exclusive path below where validateFields rejects them.
+	if unchanged, err := s.definitionUnchanged(ctx, cfg); err != nil {
+		return err
+	} else if unchanged {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,6 +83,55 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 		}
 		return s.syncSeriesFields(tx, ser.ID, cfg.Fields)
 	})
+}
+
+// definitionUnchanged reports whether the series named cfg.Name already exists
+// with a definition identical to cfg (same precision, retention, and field
+// set). It takes only the read lock, letting a redundant DefineSeries skip the
+// exclusive lock and write transaction. A missing series, or any difference,
+// reports false so the caller escalates to the full define-and-reconcile path.
+func (s *Store) definitionUnchanged(ctx context.Context, cfg Series) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var row dbSeries
+	if err := s.db.WithContext(ctx).Where("name = ?", cfg.Name).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if row.Precision != cfg.Precision || row.Retention != cfg.Retention {
+		return false, nil
+	}
+	fields, err := s.seriesFields(ctx, row.ID)
+	if err != nil {
+		return false, err
+	}
+	return sameFieldSet(fields, cfg.Fields), nil
+}
+
+// sameFieldSet reports whether want describes exactly the stored field set,
+// matching on (name, aggregate) and ignoring order. A duplicate field name in
+// want makes it not a clean match (false), so the caller escalates and
+// validateFields rejects the invalid config.
+func sameFieldSet(stored, want []Field) bool {
+	if len(stored) != len(want) {
+		return false
+	}
+	wantByName := make(map[string]string, len(want))
+	for _, f := range want {
+		wantByName[f.Name] = f.Aggregate
+	}
+	if len(wantByName) != len(want) {
+		return false
+	}
+	for _, f := range stored {
+		agg, ok := wantByName[f.Name]
+		if !ok || agg != f.Aggregate {
+			return false
+		}
+	}
+	return true
 }
 
 // validateFields checks field names are non-empty, unique, and use known

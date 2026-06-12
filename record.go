@@ -99,6 +99,10 @@ func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error 
 // is a clean replace at that timestamp. A zero oldTime skips the delete, making
 // it a plain upsert. Like Write, it takes the shared lock and rejects a zero
 // p.Time.
+//
+// A non-zero oldTime that matches no existing record returns ErrRecordNotFound
+// and the transaction is rolled back (nothing is created), so a stale or
+// concurrently-removed source can't silently masquerade as a create.
 func (s *Store) Move(ctx context.Context, series string, oldTime time.Time, p Point) error {
 	if p.Time.IsZero() {
 		return fmt.Errorf("point time cannot be zero")
@@ -124,8 +128,14 @@ func (s *Store) Move(ctx context.Context, series string, oldTime time.Time, p Po
 
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if !oldTime.IsZero() {
-			if err := tx.Where("series_id = ? AND time = ?", sid, unixMilli(oldTime)).Delete(&dbRecord{}).Error; err != nil {
-				return err
+			res := tx.Where("series_id = ? AND time = ?", sid, unixMilli(oldTime)).Delete(&dbRecord{})
+			if res.Error != nil {
+				return res.Error
+			}
+			// No record existed at oldTime: this is not a move. Roll back so we
+			// don't create a phantom point at p.Time.
+			if res.RowsAffected == 0 {
+				return ErrRecordNotFound
 			}
 		}
 		if len(rows) == 0 {
@@ -235,17 +245,25 @@ func (s *Store) FieldAt(ctx context.Context, series, field string, t time.Time) 
 }
 
 // At returns an as-of snapshot: each field's latest value at or before t.
-// The returned Point.Time is the query time t; per-field source timestamps are not kept.
-func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, error) {
+// The returned Point.Time is the query time t; per-field source timestamps are
+// not kept. found is false when no field has any sample at or before t; an
+// unknown series returns ErrSeriesNotFound (mirroring Latest/FieldAt).
+//
+// The snapshot is best-effort per field: each field resolves to its own latest
+// value <= t independently, so a Point may be partial (some fields present,
+// others absent) when fields have divergent histories. found=true means at
+// least one field resolved, not that every field did — callers that require a
+// complete record must check the field set themselves.
+func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
-		return Point{}, err
+		return Point{}, false, err
 	}
 	names, err := s.fieldNames(ctx, sid)
 	if err != nil {
-		return Point{}, err
+		return Point{}, false, err
 	}
 
 	// Portable "latest per field <= t": match rows whose time equals the per-field max <= t.
@@ -262,14 +280,17 @@ func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, erro
 		  )
 	`, tbl), sid, unixMilli(t), unixMilli(t)).Scan(&recs).Error
 	if err != nil {
-		return Point{}, err
+		return Point{}, false, err
+	}
+	if len(recs) == 0 {
+		return Point{}, false, nil
 	}
 
 	out := Point{Time: t, Values: map[string]float64{}}
 	for _, r := range recs {
 		out.Values[names[r.FieldID]] = r.Value
 	}
-	return out, nil
+	return out, true, nil
 }
 
 // Latest returns the point at the series' most recent timestamp, with its real

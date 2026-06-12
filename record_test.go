@@ -124,6 +124,49 @@ func TestMove_ZeroTime(t *testing.T) {
 	}
 }
 
+// TestMove_MissingOldTime verifies that a Move whose non-zero oldTime matches no
+// existing record reports ErrRecordNotFound and creates nothing — so a stale move
+// can't silently masquerade as a create. A zero oldTime stays a plain upsert.
+func TestMove_MissingOldTime(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestMoveMissingOldTime"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+
+			// Nothing exists at day1: the move must fail and create nothing at day2.
+			err = s.Move(ctx, "AAPL", day1, Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}})
+			if !errors.Is(err, ErrRecordNotFound) {
+				t.Fatalf("Move with missing oldTime err = %v, want ErrRecordNotFound", err)
+			}
+			pts, err := s.Range(ctx, "AAPL", time.Time{}, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pts) != 0 {
+				t.Fatalf("after failed Move: %d points, want 0 (nothing should be created)", len(pts))
+			}
+
+			// A zero oldTime is a plain upsert and must still succeed.
+			if err := s.Move(ctx, "AAPL", time.Time{}, Point{Time: day2, Values: map[string]float64{"close": 303}}); err != nil {
+				t.Fatalf("Move with zero oldTime (plain upsert) err = %v, want nil", err)
+			}
+			pts, err = s.Range(ctx, "AAPL", time.Time{}, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pts) != 1 || pts[0].Values["close"] != 303 {
+				t.Fatalf("after zero-oldTime Move: points = %+v, want one close=303", pts)
+			}
+		})
+	}
+}
+
 // TestLatest returns the point at the series' maximum timestamp with its real
 // time preserved, and reports found=false for an existing-but-empty series.
 func TestLatest(t *testing.T) {
@@ -293,7 +336,7 @@ func TestReadErrors_MissingSeries(t *testing.T) {
 			if _, _, err := s.FieldAt(ctx, "NOPE", "v", now); !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("FieldAt err = %v, want ErrSeriesNotFound", err)
 			}
-			if _, err := s.At(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
+			if _, _, err := s.At(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("At err = %v, want ErrSeriesNotFound", err)
 			}
 			if err := s.Delete(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
@@ -464,24 +507,36 @@ func TestAt_DivergentTimestamps(t *testing.T) {
 			}
 
 			// As of d3: each field resolves to its own latest <= d3.
-			snap, err := s.At(ctx, "AAPL", d3)
+			snap, found, err := s.At(ctx, "AAPL", d3)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("At(d3) found = false, want true")
 			}
 			if snap.Values["open"] != 100 || snap.Values["close"] != 200 || snap.Values["volume"] != 300 {
 				t.Fatalf("At(d3) divergent snapshot = %+v, want open=100 close=200 volume=300", snap.Values)
 			}
 
 			// As of d2: volume (only at d3) must be absent; open/close present.
-			snap2, err := s.At(ctx, "AAPL", d2)
+			// A partial snapshot (best-effort per-field) is still found=true.
+			snap2, found, err := s.At(ctx, "AAPL", d2)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("At(d2) found = false, want true (partial snapshot is still found)")
 			}
 			if _, ok := snap2.Values["volume"]; ok {
 				t.Fatalf("At(d2) should not include volume (first written at d3): %+v", snap2.Values)
 			}
 			if snap2.Values["open"] != 100 || snap2.Values["close"] != 200 {
 				t.Fatalf("At(d2) = %+v, want open=100 close=200", snap2.Values)
+			}
+
+			// Before the first point: nothing resolves, found=false.
+			if _, found, err := s.At(ctx, "AAPL", d1.Add(-time.Hour)); err != nil || found {
+				t.Fatalf("At(before d1) found=%v err=%v, want found=false", found, err)
 			}
 		})
 	}
@@ -518,9 +573,12 @@ func TestAt(t *testing.T) {
 			_, d2, _ := readFixture(t, s)
 
 			// At -> as-of snapshot of all fields
-			snap, err := s.At(context.Background(), "AAPL", d2.Add(time.Hour))
+			snap, found, err := s.At(context.Background(), "AAPL", d2.Add(time.Hour))
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("At found = false, want true")
 			}
 			if snap.Values["close"] != 103 || snap.Values["open"] != 102 || snap.Values["volume"] != 1100 {
 				t.Fatalf("At snapshot = %+v", snap.Values)

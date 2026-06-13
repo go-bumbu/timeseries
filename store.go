@@ -19,11 +19,6 @@ var ErrSeriesNotFound = errors.New("series not found")
 // Test for it with errors.Is.
 var ErrFieldNotFound = errors.New("field not found")
 
-// ErrRecordNotFound is returned (wrapped) by Move when its non-zero oldTime
-// matches no existing record, so a stale move cannot silently become a create.
-// Test for it with errors.Is.
-var ErrRecordNotFound = errors.New("record not found")
-
 // Store is the time series handle.
 //
 // All exported methods serialize against each other through an internal

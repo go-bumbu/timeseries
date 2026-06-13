@@ -26,6 +26,7 @@ type Series struct {
 	Precision time.Duration
 	Retention time.Duration
 	Fields    []Field
+	Labels    map[string]string // opaque key/value metadata; nil when none
 }
 
 // DefineSeries creates or updates a series by name and declaratively syncs its
@@ -68,6 +69,9 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 	if err := s.validateFields(cfg.Fields); err != nil {
 		return err
 	}
+	if err := validateLabels(cfg.Labels); err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		row := dbSeries{Name: cfg.Name, Precision: cfg.Precision, Retention: cfg.Retention}
 		if err := tx.Clauses(clause.OnConflict{
@@ -81,7 +85,10 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 		if err := tx.Where("name = ?", cfg.Name).First(&ser).Error; err != nil {
 			return err
 		}
-		return s.syncSeriesFields(tx, ser.ID, cfg.Fields)
+		if err := s.syncSeriesFields(tx, ser.ID, cfg.Fields); err != nil {
+			return err
+		}
+		return s.syncSeriesLabels(tx, ser.ID, cfg.Labels)
 	})
 }
 
@@ -107,7 +114,14 @@ func (s *Store) definitionUnchanged(ctx context.Context, cfg Series) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	return sameFieldSet(fields, cfg.Fields), nil
+	if !sameFieldSet(fields, cfg.Fields) {
+		return false, nil
+	}
+	labels, err := s.seriesLabels(ctx, row.ID)
+	if err != nil {
+		return false, err
+	}
+	return sameLabelSet(labels, cfg.Labels), nil
 }
 
 // sameFieldSet reports whether want describes exactly the stored field set,
@@ -226,15 +240,39 @@ func (s *Store) GetSeries(ctx context.Context, name string) (Series, error) {
 	if err != nil {
 		return Series{}, err
 	}
-	return Series{Name: row.Name, Precision: row.Precision, Retention: row.Retention, Fields: fields}, nil
+	labels, err := s.seriesLabels(ctx, row.ID)
+	if err != nil {
+		return Series{}, err
+	}
+	return Series{Name: row.Name, Precision: row.Precision, Retention: row.Retention, Fields: fields, Labels: labels}, nil
 }
 
-// ListSeries returns all series, each with its fields.
-func (s *Store) ListSeries(ctx context.Context) ([]Series, error) {
+// ListSeries returns series (each with its fields and labels). With no options
+// it returns all series; each MatchLabel option restricts the result, ANDing
+// together. Backward compatible: ListSeries(ctx) behaves as before.
+func (s *Store) ListSeries(ctx context.Context, opts ...ListOption) ([]Series, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	var f listFilter
+	for _, opt := range opts {
+		opt(&f)
+	}
+
+	q := s.db.WithContext(ctx).Order("name ASC")
+	if len(f.labels) > 0 {
+		matchIDs, err := s.matchingSeriesIDs(ctx, f.labels)
+		if err != nil {
+			return nil, err
+		}
+		if len(matchIDs) == 0 {
+			return nil, nil
+		}
+		q = q.Where("id IN ?", matchIDs)
+	}
+
 	var rows []dbSeries
-	if err := s.db.WithContext(ctx).Order("name ASC").Find(&rows).Error; err != nil {
+	if err := q.Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -252,9 +290,20 @@ func (s *Store) ListSeries(ctx context.Context) ([]Series, error) {
 	if err := s.db.WithContext(ctx).Where("series_id IN ?", ids).Order("name ASC").Find(&fields).Error; err != nil {
 		return nil, err
 	}
-	for _, f := range fields {
-		i := idx[f.SeriesID]
-		out[i].Fields = append(out[i].Fields, Field{Name: f.Name, Aggregate: f.AggregateFn})
+	for _, fl := range fields {
+		i := idx[fl.SeriesID]
+		out[i].Fields = append(out[i].Fields, Field{Name: fl.Name, Aggregate: fl.AggregateFn})
+	}
+	var labels []dbSeriesLabel
+	if err := s.db.WithContext(ctx).Where("series_id IN ?", ids).Find(&labels).Error; err != nil {
+		return nil, err
+	}
+	for _, lb := range labels {
+		i := idx[lb.SeriesID]
+		if out[i].Labels == nil {
+			out[i].Labels = make(map[string]string)
+		}
+		out[i].Labels[lb.Key] = lb.Value
 	}
 	return out, nil
 }
@@ -278,6 +327,9 @@ func (s *Store) DropSeries(ctx context.Context, name string) error {
 		if err := tx.Where("series_id = ?", row.ID).Delete(&dbField{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("series_id = ?", row.ID).Delete(&dbSeriesLabel{}).Error; err != nil {
+			return err
+		}
 		return tx.Delete(&dbSeries{}, row.ID).Error
 	})
 }
@@ -295,6 +347,9 @@ func (s *Store) Wipe(ctx context.Context) error {
 			return err
 		}
 		if err := tx.Where("1 = 1").Delete(&dbField{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&dbSeriesLabel{}).Error; err != nil {
 			return err
 		}
 		return tx.Where("1 = 1").Delete(&dbSeries{}).Error

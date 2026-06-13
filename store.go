@@ -54,7 +54,7 @@ func New(db *gorm.DB) (*Store, error) {
 	}
 	// Dimension tables are ordinary rowid tables (they use autoincrement IDs,
 	// which WITHOUT ROWID forbids).
-	if err := db.AutoMigrate(&dbSeries{}, &dbField{}); err != nil {
+	if err := db.AutoMigrate(&dbSeries{}, &dbField{}, &dbSeriesLabel{}); err != nil {
 		return nil, err
 	}
 

@@ -252,23 +252,22 @@ func (s *Store) Latest(ctx context.Context, series string) (Point, bool, error) 
 		return Point{}, false, err
 	}
 
-	// Newest timestamp for the series.
-	var newest dbRecord
-	res := s.db.WithContext(ctx).Where("series_id = ?", sid).Order("time DESC").Limit(1).Find(&newest)
-	if res.Error != nil {
-		return Point{}, false, res.Error
-	}
-	if res.RowsAffected == 0 {
-		return Point{}, false, nil
-	}
-
-	// All fields stored at that timestamp.
+	// Every field at the series' newest timestamp, read as one consistent snapshot:
+	// the MAX(time) subquery and the field read are a single statement, so a
+	// concurrent write inserting a newer point cannot land between picking the
+	// timestamp and reading its fields (the two-query version's race). MAX over an
+	// empty series is NULL, so "time = (NULL)" matches no rows → found=false.
+	newest := s.db.WithContext(ctx).Model(&dbRecord{}).
+		Select("MAX(time)").Where("series_id = ?", sid)
 	var recs []dbRecord
-	if err := s.db.WithContext(ctx).Where("series_id = ? AND time = ?", sid, newest.Time).
+	if err := s.db.WithContext(ctx).Where("series_id = ? AND time = (?)", sid, newest).
 		Order("field_id ASC").Find(&recs).Error; err != nil {
 		return Point{}, false, err
 	}
-	out := Point{Time: newest.Time.asTime(), Values: map[string]float64{}}
+	if len(recs) == 0 {
+		return Point{}, false, nil
+	}
+	out := Point{Time: recs[0].Time.asTime(), Values: map[string]float64{}}
 	for _, r := range recs {
 		out.Values[names[r.FieldID]] = r.Value
 	}
@@ -320,15 +319,84 @@ func (s *Store) Count(ctx context.Context, series string) (int, error) {
 	return int(n), nil
 }
 
-// Delete removes all fields at exactly t for the series.
-func (s *Store) Delete(ctx context.Context, series string, t time.Time) error {
+// CountAll returns the number of distinct timestamps (points) per series, keyed
+// by series name. With no options it covers every series; each MatchLabel option
+// restricts the set, ANDing together (same semantics as ListSeries). Every
+// matched series appears in the result, including those with no records (count
+// 0). It runs a single GROUP BY instead of one Count per series, so it avoids the
+// per-series query fan-out when summarizing many series at once.
+func (s *Store) CountAll(ctx context.Context, opts ...ListOption) (map[string]int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var f listFilter
+	for _, opt := range opts {
+		opt(&f)
+	}
+
+	// Resolve the matching series first, so a series with no records is still
+	// reported (count 0) and the result can be keyed by name.
+	q := s.db.WithContext(ctx).Model(&dbSeries{})
+	if len(f.labels) > 0 {
+		matchIDs, err := s.matchingSeriesIDs(ctx, f.labels)
+		if err != nil {
+			return nil, err
+		}
+		if len(matchIDs) == 0 {
+			return map[string]int{}, nil
+		}
+		q = q.Where("id IN ?", matchIDs)
+	}
+	var rows []dbSeries
+	if err := q.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(rows))
+	if len(rows) == 0 {
+		return out, nil
+	}
+	nameByID := make(map[uint]string, len(rows))
+	ids := make([]uint, len(rows))
+	for i, r := range rows {
+		nameByID[r.ID] = r.Name
+		ids[i] = r.ID
+		out[r.Name] = 0
+	}
+
+	// One GROUP BY collapses what would otherwise be one Count per series.
+	var counts []struct {
+		SeriesID uint
+		N        int
+	}
+	if err := s.db.WithContext(ctx).Model(&dbRecord{}).
+		Select("series_id, COUNT(DISTINCT time) AS n").
+		Where("series_id IN ?", ids).
+		Group("series_id").
+		Scan(&counts).Error; err != nil {
+		return nil, err
+	}
+	for _, c := range counts {
+		out[nameByID[c.SeriesID]] = c.N
+	}
+	return out, nil
+}
+
+// Delete removes all fields at exactly t for the series. It reports whether a
+// record existed at t: deleted is false (with a nil error) when no row matched,
+// so callers can distinguish a real delete from a no-op. An unknown series
+// returns ErrSeriesNotFound.
+func (s *Store) Delete(ctx context.Context, series string, t time.Time) (deleted bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s.db.WithContext(ctx).Where("series_id = ? AND time = ?", sid, unixMilli(t)).Delete(&dbRecord{}).Error
+	res := s.db.WithContext(ctx).Where("series_id = ? AND time = ?", sid, unixMilli(t)).Delete(&dbRecord{})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // DeleteRange removes all records in [start, end] for the series. Pass a zero

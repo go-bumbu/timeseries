@@ -3,10 +3,12 @@ package timeseries
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/go-bumbu/testdbs"
+	"gorm.io/gorm"
 )
 
 func setupAAPL(t *testing.T, s *Store) {
@@ -111,6 +113,60 @@ func TestLatest(t *testing.T) {
 	}
 }
 
+// TestLatest_SingleStatementSnapshot guards that Latest reads the newest point in a
+// single SQL statement against the records table, not two. The old implementation ran
+// two queries (find the newest timestamp, then fetch that timestamp's fields) with a
+// gap a concurrent write could slip into — returning a stale point (a newer timestamp
+// landed between the queries) or a torn one. A single MAX(time) subquery read takes a
+// consistent snapshot, closing that window.
+func TestLatest_SingleStatementSnapshot(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestLatestSnapshot"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"open": 100, "close": 101, "volume": 1000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}}); err != nil {
+				t.Fatal(err)
+			}
+
+			recordsTable := (dbRecord{}).TableName()
+			var recordSelects int
+			const cb = "count_record_selects"
+			// Count only real round-trips against the records table. GORM also runs the
+			// MAX(time) subquery's callbacks in DryRun to build its SQL for inlining;
+			// those don't touch the database, so skip them.
+			if err := s.db.Callback().Query().After("gorm:query").Register(cb, func(db *gorm.DB) {
+				if db.Statement.Table == recordsTable && !db.DryRun {
+					recordSelects++
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.db.Callback().Query().Remove(cb) }()
+
+			p, found, err := s.Latest(ctx, "AAPL")
+			if err != nil || !found {
+				t.Fatalf("Latest: found=%v err=%v, want true nil", found, err)
+			}
+			if !p.Time.Equal(day2) || p.Values["open"] != 200 || p.Values["close"] != 202 {
+				t.Fatalf("Latest = {%v %v}, want day2 open=200 close=202", p.Time, p.Values)
+			}
+			if recordSelects != 1 {
+				t.Fatalf("Latest issued %d SELECTs against %q, want 1 (single-statement snapshot; two queries race with concurrent writes)", recordSelects, recordsTable)
+			}
+		})
+	}
+}
+
 // TestLatestField returns the newest (time, value) for one field, with the real
 // timestamp, and found=false when the field has no samples.
 func TestLatestField(t *testing.T) {
@@ -186,6 +242,70 @@ func TestCount(t *testing.T) {
 	}
 }
 
+// TestCountAll returns distinct-timestamp counts per series in one query,
+// includes zero-record series, and honors MatchLabel filters like ListSeries.
+func TestCountAll(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(tdb.ConnDbName("TestCountAll"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			mk := func(name, typ string) Series {
+				return Series{
+					Name: name, Precision: 24 * time.Hour, Retention: 365 * 24 * time.Hour,
+					Fields: []Field{{Name: "open", Aggregate: AggFirst}, {Name: "close", Aggregate: AggLast}},
+					Labels: map[string]string{"type": typ},
+				}
+			}
+			for _, cfg := range []Series{mk("AAPL", "price"), mk("MSFT", "price"), mk("EURUSD", "fx")} {
+				if err := s.DefineSeries(ctx, cfg); err != nil {
+					t.Fatalf("DefineSeries %s: %v", cfg.Name, err)
+				}
+			}
+			// AAPL: 3 points, each with multiple fields → still 3 distinct timestamps.
+			for i := 0; i < 3; i++ {
+				day := time.Date(2025, 1, 2+i, 0, 0, 0, 0, time.UTC)
+				if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"open": 1, "close": 2}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// EURUSD: 1 point. MSFT: no records (must still appear with count 0).
+			if err := s.Write(ctx, "EURUSD", Point{Time: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC), Values: map[string]float64{"close": 1}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// No options -> every series, zero-record series included.
+			all, err := s.CountAll(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string]int{"AAPL": 3, "MSFT": 0, "EURUSD": 1}; !reflect.DeepEqual(all, want) {
+				t.Fatalf("CountAll() = %v, want %v", all, want)
+			}
+
+			// MatchLabel restricts the set like ListSeries.
+			price, err := s.CountAll(ctx, MatchLabel("type", "price"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string]int{"AAPL": 3, "MSFT": 0}; !reflect.DeepEqual(price, want) {
+				t.Fatalf("CountAll(type=price) = %v, want %v", price, want)
+			}
+
+			// No match -> empty, non-nil.
+			none, err := s.CountAll(ctx, MatchLabel("type", "nope"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(none) != 0 {
+				t.Fatalf("CountAll(type=nope) = %v, want empty", none)
+			}
+		})
+	}
+}
+
 func TestWrite_Errors(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
@@ -238,7 +358,7 @@ func TestReadErrors_MissingSeries(t *testing.T) {
 			if _, _, err := s.At(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("At err = %v, want ErrSeriesNotFound", err)
 			}
-			if err := s.Delete(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
+			if _, err := s.Delete(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("Delete err = %v, want ErrSeriesNotFound", err)
 			}
 			if err := s.DeleteRange(ctx, "NOPE", time.Time{}, time.Time{}); !errors.Is(err, ErrSeriesNotFound) {
@@ -503,9 +623,13 @@ func TestDeletes(t *testing.T) {
 				}
 			}
 
-			// Delete one point (all its fields)
-			if err := s.Delete(context.Background(), "AAPL", d2); err != nil {
+			// Delete one point (all its fields); a matching record reports deleted=true
+			deleted, err := s.Delete(context.Background(), "AAPL", d2)
+			if err != nil {
 				t.Fatal(err)
+			}
+			if !deleted {
+				t.Fatalf("Delete(d2) deleted = false, want true")
 			}
 			var c int64
 			if err := s.db.Model(&dbRecord{}).Where("time = ?", unixMilli(d2)).Count(&c).Error; err != nil {
@@ -513,6 +637,15 @@ func TestDeletes(t *testing.T) {
 			}
 			if c != 0 {
 				t.Fatalf("after Delete(d2) count = %d, want 0", c)
+			}
+
+			// Deleting the now-empty timestamp again is a no-op: deleted=false, nil error
+			deleted, err = s.Delete(context.Background(), "AAPL", d2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deleted {
+				t.Fatalf("re-Delete(d2) deleted = true, want false")
 			}
 
 			// DeleteRange removes d1 (and would remove d2 if present)

@@ -38,7 +38,8 @@ type Series struct {
 // no-op that takes only the read lock — it neither acquires the exclusive lock
 // nor opens a write transaction. This keeps the common auto-register-before-
 // write pattern cheap. Only an actual change (new series, or differing
-// precision/retention/fields) escalates to the exclusive define-and-reconcile.
+// precision/retention/fields/labels) escalates to the exclusive
+// define-and-reconcile.
 //
 // On that escalation path DefineSeries takes the Store lock exclusively: it
 // cannot run concurrently with writes, reads, or Maintain on the same Store,
@@ -93,8 +94,8 @@ func (s *Store) DefineSeries(ctx context.Context, cfg Series) error {
 }
 
 // definitionUnchanged reports whether the series named cfg.Name already exists
-// with a definition identical to cfg (same precision, retention, and field
-// set). It takes only the read lock, letting a redundant DefineSeries skip the
+// with a definition identical to cfg (same precision, retention, field set, and
+// labels). It takes only the read lock, letting a redundant DefineSeries skip the
 // exclusive lock and write transaction. A missing series, or any difference,
 // reports false so the caller escalates to the full define-and-reconcile path.
 func (s *Store) definitionUnchanged(ctx context.Context, cfg Series) (bool, error) {

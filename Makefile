@@ -81,7 +81,7 @@ check_env: # check for needed envs
 	@[ "${version}" ] || ( echo ">> version is not set, usage: make tag version=\"v1.2.3\" "; exit 1 )
 
 
-tag: check_env check-branch check-git-clean verify ## create a tag and push to git
+tag: check_env check-branch check-git-clean verify test-alldbs ## create a tag and push to git
 	@git diff --quiet || ( echo 'git is in dirty state' ; exit 1 )
 	@[ "${version}" ] || ( echo ">> version is not set, usage: make tag version=\"v1.2.3\" "; exit 1 )
 	@git tag -d $(version) || true

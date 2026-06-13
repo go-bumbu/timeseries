@@ -2,21 +2,25 @@ package timeseries
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/go-bumbu/testdbs"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
-	timingNumIngest   = 3650
-	timingNumRetrieve = 10
-	timingNumRuns     = 10
+	timingNumIngest = 3650
+	timingNumRuns   = 10
 )
 
-// p90 returns the 90th percentile duration from the slice (sorted ascending).
 func p90(durs []time.Duration) time.Duration {
 	if len(durs) == 0 {
 		return 0
@@ -24,79 +28,93 @@ func p90(durs []time.Duration) time.Duration {
 	sorted := make([]time.Duration, len(durs))
 	copy(sorted, durs)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	idx := (len(sorted) - 1) * 90 / 100
-	return sorted[idx]
+	return sorted[(len(sorted)-1)*90/100]
 }
 
-// TestTiming runs the full sequence (register, ingest 3650, maintenance, retrieve 10x) timingNumRuns times
-// per DB, then logs the 90th percentile duration for each operation.
 func TestTiming(t *testing.T) {
-	for _, db := range testdbs.DBs() {
-		t.Run(db.DbType(), func(t *testing.T) {
-			var registerDurs, ingestDurs, maintenanceDurs, retrieveDurs []time.Duration
-
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			var ingestDurs, retrieveDurs []time.Duration
 			for run := 0; run < timingNumRuns; run++ {
-				dbCon := db.ConnDbName("TestTiming_" + strconv.Itoa(run))
-				store, err := NewRegistry(dbCon)
+				s, err := New(connDB(t, tdb,"TestTiming_" + strconv.Itoa(run)))
 				if err != nil {
 					t.Fatal(err)
 				}
-
-				seriesName := "timing_series"
-				base := time.Now().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
-
-				// 1. Register series
-				t0 := time.Now()
-				series := TimeSeries{
-					Name: seriesName,
-					Retention: SamplingPolicy{
-						Precision:   time.Hour,
-						Retention:   365 * 24 * time.Hour,
-						AggregateFn: AggregateAVG,
-					},
+				base := time.Now().UTC().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
+				if err := s.DefineSeries(context.Background(), Series{
+					Name: "ts", Precision: time.Hour, Retention: 365 * 24 * time.Hour,
+					Fields: []Field{{Name: "v", Aggregate: AggAvg}},
+				}); err != nil {
+					t.Fatal(err)
 				}
-				if err := store.RegisterSeries(series); err != nil {
-					t.Fatalf("RegisterSeries: %v", err)
-				}
-				registerDurs = append(registerDurs, time.Since(t0))
 
-				// 2. Ingest 3650 items in bulk
-				points := make([]DataPoint, timingNumIngest)
-				for i := 0; i < timingNumIngest; i++ {
-					points[i] = DataPoint{
-						Time:  base.Add(time.Duration(i) * time.Minute),
-						Value: float64(i),
-					}
+				pts := make([]Point, timingNumIngest)
+				for i := range pts {
+					pts[i] = Point{Time: base.Add(time.Duration(i) * time.Minute), Values: map[string]float64{"v": float64(i)}}
 				}
 				t1 := time.Now()
-				if _, err := store.IngestBulk(seriesName, points); err != nil {
-					t.Fatalf("IngestBulk(%d): %v", timingNumIngest, err)
+				if err := s.WriteMany(context.Background(), "ts", pts); err != nil {
+					t.Fatal(err)
 				}
 				ingestDurs = append(ingestDurs, time.Since(t1))
 
-				// 3. Run maintenance once
-				t2 := time.Now()
-				if err := store.Maintenance(context.Background()); err != nil {
-					t.Fatalf("Maintenance: %v", err)
-				}
-				maintenanceDurs = append(maintenanceDurs, time.Since(t2))
+				_ = s.Maintain(context.Background())
 
-				// 4. Retrieve 10 times (ListRecords over full range)
-				start := base
-				end := base.Add(time.Duration(timingNumIngest) * time.Minute)
 				t3 := time.Now()
-				for i := 0; i < timingNumRetrieve; i++ {
-					if _, err := store.ListRecords(seriesName, start, end); err != nil {
-						t.Fatalf("ListRecords: %v", err)
-					}
+				if _, err := s.FieldRange(context.Background(), "ts", "v", base, base.Add(time.Duration(timingNumIngest)*time.Minute)); err != nil {
+					t.Fatal(err)
 				}
 				retrieveDurs = append(retrieveDurs, time.Since(t3))
 			}
-
-			t.Logf("%s register_series p90: %s (n=%d)", db.DbType(), p90(registerDurs), timingNumRuns)
-			t.Logf("%s ingest_bulk_%d p90: %s (n=%d)", db.DbType(), timingNumIngest, p90(ingestDurs), timingNumRuns)
-			t.Logf("%s maintenance p90: %s (n=%d)", db.DbType(), p90(maintenanceDurs), timingNumRuns)
-			t.Logf("%s retrieve_x%d p90: %s (n=%d)", db.DbType(), timingNumRetrieve, p90(retrieveDurs), timingNumRuns)
+			t.Logf("%s ingest_%d p90: %s", tdb.DbType(), timingNumIngest, p90(ingestDurs))
+			t.Logf("%s retrieve p90: %s", tdb.DbType(), p90(retrieveDurs))
 		})
+	}
+}
+
+// TestStorageFootprint guards against rowid-table / text-time regressions on SQLite.
+func TestStorageFootprint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fp.db")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DefineSeries(context.Background(), Series{
+		Name: "fp", Precision: 24 * time.Hour, Retention: 100 * 365 * 24 * time.Hour,
+		Fields: []Field{{Name: "v", Aggregate: ""}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 50000
+	pts := make([]Point, n)
+	base := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := range pts {
+		pts[i] = Point{Time: base.Add(time.Duration(i) * time.Minute), Values: map[string]float64{"v": float64(i)}}
+	}
+	if err := s.WriteMany(context.Background(), "fp", pts); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	if _, err := sqlDB.Exec("VACUUM"); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytesPerRow := float64(info.Size()) / float64(n)
+	t.Logf("footprint: %d bytes / %d rows = %.1f bytes/row", info.Size(), n, bytesPerRow)
+	// Clustered WITHOUT ROWID lands ~22-28 B/row incl. page overhead. A rowid table
+	// with a composite-PK index is ~39 B/row; text timestamps push well past 50.
+	// A ceiling of 35 catches both regressions while leaving headroom for the happy path.
+	if bytesPerRow > 35 {
+		t.Fatalf("bytes/row = %.1f, expected under 35 (rowid-table or text-time regression?)", bytesPerRow)
 	}
 }

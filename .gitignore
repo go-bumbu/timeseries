@@ -16,3 +16,7 @@
 cover.html
 cover.out
 coverage.out
+.directory
+
+# Superpowers specs/plans (local workflow artifacts)
+docs/superpowers/

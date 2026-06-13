@@ -1,855 +1,810 @@
 package timeseries
 
 import (
-	"sort"
-	"strings"
+	"context"
+	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/go-bumbu/testdbs"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
+	"gorm.io/gorm"
 )
 
-var testRecords = []Record{
-	{Series: "btc_price", Time: getDateTime("2025-01-01 00:00:00"), Value: 10000},
-	{Series: "btc_price", Time: getDateTime("2025-01-02 00:00:00"), Value: 11000},
-	{Series: "btc_price", Time: getDateTime("2025-01-03 00:00:00"), Value: 12000},
-	{Series: "btc_price", Time: getDateTime("2025-01-04 00:00:00"), Value: 13000},
-	{Series: "btc_price", Time: getDateTime("2025-01-05 00:00:00"), Value: 14000},
-	{Series: "btc_price", Time: getDateTime("2025-01-06 00:00:00"), Value: 15000},
-	{Series: "btc_price", Time: getDateTime("2025-01-07 00:00:00"), Value: 16000},
-	{Series: "btc_price", Time: getDateTime("2025-01-08 00:00:00"), Value: 17000},
-	{Series: "btc_price", Time: getDateTime("2025-01-09 00:00:00"), Value: 18000},
-	{Series: "btc_price", Time: getDateTime("2025-01-10 00:00:00"), Value: 19000},
+func setupAAPL(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.DefineSeries(context.Background(), Series{
+		Name:      "AAPL",
+		Precision: 24 * time.Hour,
+		Retention: 365 * 24 * time.Hour,
+		Fields: []Field{
+			{Name: "open", Aggregate: AggFirst},
+			{Name: "close", Aggregate: AggLast},
+			{Name: "volume", Aggregate: AggSum},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestIngestSeries(t *testing.T) {
-	tcs := []struct {
-		name    string
-		input   Record
-		wantErr string
-	}{
-		{
-			name: "create valid record",
-			input: Record{
-				Series: "btc_price",
-				Time:   time.Now(),
-				Value:  68000.5,
-			},
-		},
-		{
-			name: "want error on empty series name",
-			input: Record{
-				Time:  time.Now(),
-				Value: 123.4,
-			},
-			wantErr: "timeseries name cannot be empty",
-		},
-		{
-			name: "want error on zero time",
-			input: Record{
-				Series: "btc_price",
-				Value:  100.0,
-			},
-			wantErr: "time value cannot be zero",
-		},
-		{
-			name: "want error on missing series in getDb",
-			input: Record{
-				Series: "unknown_series",
-				Time:   time.Now(),
-				Value:  99.9,
-			},
-			wantErr: "failed to lookup series: record not found",
-		},
-	}
-
-	for _, db := range testdbs.DBs() {
-		t.Run(db.DbType(), func(t *testing.T) {
-
-			dbCon := db.ConnDbName("TestSeriesIngest")
-			store, err := NewRegistry(dbCon)
+func TestWrite_Upsert(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestWriteUpsert"))
 			if err != nil {
 				t.Fatal(err)
 			}
+			setupAAPL(t, s)
+			day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
 
-			// Arrange: create a known series so that valid tests can use it
-			existingSeries := dbTimeSeries{Name: "btc_price"}
-			if err := store.db.Create(&existingSeries).Error; err != nil {
-				t.Fatalf("failed to create test series: %v", err)
+			if err := s.Write(context.Background(), "AAPL", Point{Time: day, Values: map[string]float64{
+				"open": 100, "close": 101, "volume": 1000,
+			}}); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			// re-write same timestamp: must overwrite, not duplicate
+			if err := s.Write(context.Background(), "AAPL", Point{Time: day, Values: map[string]float64{
+				"open": 100, "close": 105, "volume": 2000,
+			}}); err != nil {
+				t.Fatalf("Write 2: %v", err)
 			}
 
-			// Create main retention policy for the series
-			mainPolicy := dbSamplingPolicy{
-				TimeSeriesID:  existingSeries.ID,
-				Name:          mainPolicyName,
-				Precision:     time.Minute,
-				Retention:     24 * time.Hour,
-				AggregationFn: "avg",
+			var count int64
+			if err := s.db.Model(&dbRecord{}).Count(&count).Error; err != nil {
+				t.Fatal(err)
 			}
-			if err := store.db.Create(&mainPolicy).Error; err != nil {
-				t.Fatalf("failed to create main policy: %v", err)
+			if count != 3 {
+				t.Fatalf("row count = %d, want 3 (upsert must not duplicate)", count)
 			}
-			existingSeries.Policies = []dbSamplingPolicy{mainPolicy}
 
-			for _, tc := range tcs {
-				t.Run(tc.name, func(t *testing.T) {
-
-					_, err := store.Ingest(tc.input.Series, tc.input.Time, tc.input.Value)
-
-					if tc.wantErr != "" {
-						// Expecting an error
-						if err == nil {
-							t.Fatalf("expected error: %s, but got none", tc.wantErr)
-						}
-						if !strings.Contains(err.Error(), tc.wantErr) {
-							t.Errorf("expected error containing %q, got %v", tc.wantErr, err.Error())
-						}
-
-					} else {
-						// No error expected
-						if err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-
-						// Verify the record is in the DB
-						var got []dbRecord
-						if err := store.db.Find(&got).Error; err != nil {
-							t.Fatalf("failed to query getDb: %v", err)
-						}
-
-						if len(got) == 0 {
-							t.Fatalf("expected at least 1 record, got 0")
-						}
-
-						// Find the last inserted record
-						sort.Slice(got, func(i, j int) bool {
-							return got[i].Id > got[j].Id
-						})
-
-						last := got[0]
-
-						if last.SamplingId != existingSeries.mainPolicyID() {
-							t.Errorf("expected SamplingId=%d, got %d", existingSeries.mainPolicyID(), last.SamplingId)
-						}
-
-						if last.Value != tc.input.Value {
-							t.Errorf("expected Value=%.2f, got %.2f", tc.input.Value, last.Value)
-						}
-					}
-
-				})
+			v, found, err := s.FieldAt(context.Background(), "AAPL", "close", day)
+			if err != nil || !found {
+				t.Fatalf("FieldAt: v=%v found=%v err=%v", v, found, err)
+			}
+			if v != 105 {
+				t.Fatalf("close = %v, want 105 (overwritten)", v)
 			}
 		})
 	}
 }
 
-func TestIngestBulk(t *testing.T) {
-	tcs := []struct {
-		name      string
-		series    string
-		points    []DataPoint
-		wantIDs   int
-		wantErr   string
-		skipSetup bool // true for "unknown series" so we don't register it
-	}{
-		{
-			name:    "empty points returns nil ids",
-			series:  "bulk_empty",
-			points:  nil,
-			wantIDs: 0,
-		},
-		{
-			name:    "empty slice returns nil ids",
-			series:  "bulk_empty_slice",
-			points:  []DataPoint{},
-			wantIDs: 0,
-		},
-		{
-			name:    "single point",
-			series:  "bulk_single",
-			points:  []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 42}},
-			wantIDs: 1,
-		},
-		{
-			name:   "multiple points",
-			series: "bulk_multi",
-			points: []DataPoint{
-				{Time: getDateTime("2025-01-01 10:00:00"), Value: 1},
-				{Time: getDateTime("2025-01-01 11:00:00"), Value: 2},
-				{Time: getDateTime("2025-01-01 12:00:00"), Value: 3},
-			},
-			wantIDs: 3,
-		},
-		{
-			name:      "invalid series",
-			series:    "unknown_series",
-			points:    []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 1}},
-			wantErr:   "failed to lookup series",
-			skipSetup: true,
-		},
-		{
-			name:      "empty series name",
-			series:    "",
-			points:    []DataPoint{{Time: getDateTime("2025-01-01 12:00:00"), Value: 1}},
-			wantErr:   "timeseries name cannot be empty",
-			skipSetup: true,
-		},
-		{
-			name:      "zero time at index 0",
-			series:    "bulk_zero",
-			points:    []DataPoint{{Time: time.Time{}, Value: 1}},
-			wantErr:   "time value cannot be zero",
-			skipSetup: true,
-		},
-		{
-			name:   "zero time at index 1",
-			series: "bulk_zero_idx",
-			points: []DataPoint{
-				{Time: getDateTime("2025-01-01 10:00:00"), Value: 1},
-				{Time: time.Time{}, Value: 2},
-			},
-			wantErr:   "time value cannot be zero",
-			skipSetup: true,
-		},
-	}
-
-	for _, db := range testdbs.DBs() {
-		t.Run(db.DbType(), func(t *testing.T) {
-			dbCon := db.ConnDbName("TestIngestBulk")
-			store, err := NewRegistry(dbCon)
+// TestLatest returns the point at the series' maximum timestamp with its real
+// time preserved, and reports found=false for an existing-but-empty series.
+func TestLatest(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestLatest"))
 			if err != nil {
 				t.Fatal(err)
 			}
+			ctx := context.Background()
+			setupAAPL(t, s)
 
-			for _, tc := range tcs {
-				t.Run(tc.name, func(t *testing.T) {
-					if !tc.skipSetup {
-						ts := TimeSeries{
-							Name: tc.series,
-							Retention: SamplingPolicy{
-								Precision: time.Minute,
-								Retention: 24 * time.Hour,
-							},
-						}
-						if err := store.RegisterSeries(ts); err != nil {
-							t.Fatalf("setup: RegisterSeries: %v", err)
-						}
-					}
+			// Empty series: CoverageNone, no error.
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageNone {
+				t.Fatalf("Latest on empty series: cov=%v err=%v, want CoverageNone nil", cov, err)
+			}
 
-					ids, err := store.IngestBulk(tc.series, tc.points)
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"open": 100, "close": 101, "volume": 1000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}}); err != nil {
+				t.Fatal(err)
+			}
 
-					if tc.wantErr != "" {
-						if err == nil {
-							t.Fatalf("expected error containing %q, got nil", tc.wantErr)
-						}
-						if !strings.Contains(err.Error(), tc.wantErr) {
-							t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
-						}
-						return
-					}
-					if err != nil {
-						t.Fatalf("unexpected error: %v", err)
-					}
-					if tc.wantIDs == 0 {
-						if ids != nil {
-							t.Errorf("expected nil ids, got len=%d", len(ids))
-						}
-						return
-					}
-					if len(ids) != tc.wantIDs {
-						t.Errorf("expected %d ids, got %d: %v", tc.wantIDs, len(ids), ids)
-					}
-					// IDs should be distinct and non-zero
-					seen := make(map[uint]bool)
-					for _, id := range ids {
-						if id == 0 {
-							t.Error("expected non-zero id")
-						}
-						if seen[id] {
-							t.Errorf("duplicate id %d", id)
-						}
-						seen[id] = true
-					}
+			p, cov, err := s.Latest(ctx, "AAPL")
+			if err != nil || cov != CoverageFull {
+				t.Fatalf("Latest: cov=%v err=%v, want CoverageFull nil", cov, err)
+			}
+			if !p.Time.Equal(day2) {
+				t.Fatalf("Latest time = %v, want %v (real timestamp, not query time)", p.Time, day2)
+			}
+			if p.Values["close"] != 202 || p.Values["open"] != 200 {
+				t.Fatalf("Latest values = %v, want open=200 close=202", p.Values)
+			}
 
-					// Verify records in DB when we inserted something
-					if tc.wantIDs > 0 && !tc.skipSetup {
-						got, err := store.ListRecords(tc.series, time.Time{}, time.Time{})
-						if err != nil {
-							t.Fatalf("ListRecords: %v", err)
-						}
-						if len(got) != tc.wantIDs {
-							t.Errorf("ListRecords: expected %d records, got %d", tc.wantIDs, len(got))
-						}
-					}
-				})
+			// Unknown series propagates ErrSeriesNotFound.
+			if _, _, err := s.Latest(ctx, "NOPE"); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("Latest on unknown series err = %v, want ErrSeriesNotFound", err)
 			}
 		})
 	}
 }
 
-func TestUpdateRecord(t *testing.T) {
-	t.Run("happy path", func(t *testing.T) {
-		tcs := []struct {
-			name       string
-			policyName string // which policy the record belongs to (main only)
-			update     RecordUpdate
-			seriesName string
-			wantValue  float64 // expected value after update
-			wantTime   time.Time
-		}{
-			{
-				name:       "update value only in main policy",
-				policyName: "main",
-				update:     RecordUpdate{Value: ptr(999.99)},
-				seriesName: "btc_price",
-				wantValue:  999.99,
-				wantTime:   getDateTime("2022-01-07 00:00:00"),
-			},
-			{
-				name:       "update time only in main policy",
-				policyName: "main",
-				update:     RecordUpdate{Time: ptr(getDateTime("2022-01-08 00:00:00"))},
-				seriesName: "eth_price",
-				wantValue:  100.0,
-				wantTime:   getDateTime("2022-01-08 00:00:00"),
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				dbCon := db.ConnDbName("TestUpdateRecord_happy")
-				store, err := NewRegistry(dbCon)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						series := dbTimeSeries{Name: tc.seriesName}
-						if err := store.db.Create(&series).Error; err != nil {
-							t.Fatalf("failed to create series: %v", err)
-						}
-
-						// Create main policy
-						mainPolicy := dbSamplingPolicy{
-							TimeSeriesID:  series.ID,
-							Name:          "main",
-							Precision:     time.Minute,
-							Retention:     24 * time.Hour,
-							AggregationFn: "avg",
-						}
-						if err := store.db.Create(&mainPolicy).Error; err != nil {
-							t.Fatalf("failed to create main policy: %v", err)
-						}
-
-						targetPolicy := mainPolicy
-
-						// Create record in target policy
-						r1 := dbRecord{
-							SamplingId: targetPolicy.ID,
-							Time:       getDateTime("2022-01-07 00:00:00"),
-							Value:      100.0,
-						}
-						if err := store.db.Create(&r1).Error; err != nil {
-							t.Fatalf("failed to create record: %v", err)
-						}
-
-						// Update the record
-						err := store.UpdateRecord(r1.Id, tc.update)
-						if err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-
-						// Verify by reading the record directly from DB
-						var updated dbRecord
-						if err := store.db.First(&updated, r1.Id).Error; err != nil {
-							t.Fatalf("failed to read updated record: %v", err)
-						}
-
-						if updated.Value != tc.wantValue {
-							t.Errorf("expected value %v, got %v", tc.wantValue, updated.Value)
-						}
-						if !updated.Time.Equal(tc.wantTime) {
-							t.Errorf("expected time %v, got %v", tc.wantTime, updated.Time)
-						}
-					})
-				}
-			})
-		}
-	})
-
-	t.Run("error cases", func(t *testing.T) {
-		tcs := []struct {
-			name     string
-			targetID uint
-			update   RecordUpdate
-			wantErr  string
-		}{
-			{
-				name:     "error on zero id",
-				targetID: 0,
-				wantErr:  "record id is required for update",
-			},
-			{
-				name:     "error on non-existing record",
-				targetID: 999,
-				wantErr:  "record not found: record not found",
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				dbCon := db.ConnDbName("TestUpdateRecord_error")
-				store, err := NewRegistry(dbCon)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						err := store.UpdateRecord(tc.targetID, tc.update)
-
-						if err == nil {
-							t.Fatalf("expected error %q, got none", tc.wantErr)
-						}
-						if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
-							t.Errorf("unexpected error (-want +got):\n%s", diff)
-						}
-					})
-				}
-			})
-		}
-	})
-}
-
-func TestDeleteRecord(t *testing.T) {
-	t.Run("happy path", func(t *testing.T) {
-		tcs := []struct {
-			name       string
-			policyName string
-			seriesName string
-		}{
-			{
-				name:       "delete record from main policy",
-				policyName: "main",
-				seriesName: "btc_price",
-			},
-			{
-				name:       "delete non-existing record does not error",
-				policyName: "main",
-				seriesName: "ada_price",
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				dbCon := db.ConnDbName("TestDeleteRecord_happy")
-				store, err := NewRegistry(dbCon)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						series := dbTimeSeries{Name: tc.seriesName}
-						if err := store.db.Create(&series).Error; err != nil {
-							t.Fatalf("failed to create series: %v", err)
-						}
-
-						// Create main policy
-						mainPolicy := dbSamplingPolicy{
-							TimeSeriesID:  series.ID,
-							Name:          "main",
-							Precision:     time.Minute,
-							Retention:     24 * time.Hour,
-							AggregationFn: "avg",
-						}
-						if err := store.db.Create(&mainPolicy).Error; err != nil {
-							t.Fatalf("failed to create main policy: %v", err)
-						}
-
-						targetPolicy := mainPolicy
-
-						// Create record in target policy
-						r1 := dbRecord{
-							SamplingId: targetPolicy.ID,
-							Time:       getDateTime("2022-01-07 00:00:00"),
-							Value:      100.0,
-						}
-						if err := store.db.Create(&r1).Error; err != nil {
-							t.Fatalf("failed to create record: %v", err)
-						}
-
-						recordId := r1.Id
-						// For the "delete non-existing" test, use a non-existing ID
-						if tc.name == "delete non-existing record does not error" {
-							recordId = 999999
-						}
-
-						// Delete the record
-						err := store.DeleteRecord(recordId)
-						if err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-
-						// Verify record is deleted (only for existing records)
-						if tc.name != "delete non-existing record does not error" {
-							var deleted dbRecord
-							err := store.db.First(&deleted, r1.Id).Error
-							if err == nil {
-								t.Errorf("expected record to be deleted, but it still exists")
-							}
-						}
-					})
-				}
-			})
-		}
-	})
-
-	t.Run("error cases", func(t *testing.T) {
-		tcs := []struct {
-			name     string
-			recordID uint
-			wantErr  string
-		}{
-			{
-				name:     "error on zero id",
-				recordID: 0,
-				wantErr:  "record id cannot be zero",
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				dbCon := db.ConnDbName("TestDeleteRecord_error")
-				store, err := NewRegistry(dbCon)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						err := store.DeleteRecord(tc.recordID)
-
-						if err == nil {
-							t.Fatalf("expected error %q, got none", tc.wantErr)
-						}
-						if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
-							t.Errorf("unexpected error (-want +got):\n%s", diff)
-						}
-					})
-				}
-			})
-		}
-	})
-}
-
-func TestListRecords(t *testing.T) {
-	t.Run("happy path", func(t *testing.T) {
-		tcs := []struct {
-			name       string
-			SeriesName string
-			records    map[string][]Record // key is policy name (main only), value is records for that policy
-			start      time.Time
-			end        time.Time
-			want       []Record // expected output from ListRecords (main retention policy only)
-		}{
-			{
-				name:       "list multiple records from main retention",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-					},
-				},
-				start: time.Time{},
-				end:   time.Time{},
-				want: []Record{
-					{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-				},
-			},
-			{
-				name:       "list single record",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-05 00:00:00"), Value: 999.99},
-					},
-				},
-				start: time.Time{},
-				end:   time.Time{},
-				want: []Record{
-					{Time: getDateTime("2022-01-05 00:00:00"), Value: 999.99},
-				},
-			},
-			{
-				name:       "list empty series",
-				SeriesName: "banana",
-				records:    map[string][]Record{"main": {}},
-				start:      time.Time{},
-				end:        time.Time{},
-				want:       []Record{},
-			},
-			{
-				name:       "filter with start time only",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
-					},
-				},
-				start: getDateTime("2022-01-02 00:00:00"),
-				end:   time.Time{},
-				want: []Record{
-					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-					{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
-				},
-			},
-			{
-				name:       "filter with end time only",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
-					},
-				},
-				start: time.Time{},
-				end:   getDateTime("2022-01-03 00:00:00"),
-				want: []Record{
-					{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-				},
-			},
-			{
-				name:       "filter with both start and end time",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-						{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-						{Time: getDateTime("2022-01-04 00:00:00"), Value: 400.0},
-					},
-				},
-				start: getDateTime("2022-01-02 00:00:00"),
-				end:   getDateTime("2022-01-03 00:00:00"),
-				want: []Record{
-					{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-					{Time: getDateTime("2022-01-03 00:00:00"), Value: 300.0},
-				},
-			},
-			{
-				name:       "filter returns empty when range has no matches",
-				SeriesName: "banana",
-				records: map[string][]Record{
-					"main": {
-						{Time: getDateTime("2022-01-01 00:00:00"), Value: 100.0},
-						{Time: getDateTime("2022-01-02 00:00:00"), Value: 200.0},
-					},
-				},
-				start: getDateTime("2022-01-05 00:00:00"),
-				end:   getDateTime("2022-01-10 00:00:00"),
-				want:  []Record{},
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						dbCon := db.ConnDbName("TestListRecords_" + tc.name)
-						store, err := NewRegistry(dbCon)
-						if err != nil {
-							t.Fatal(err)
-						}
-
-						series := dbTimeSeries{Name: tc.SeriesName}
-						if err := store.db.Create(&series).Error; err != nil {
-							t.Fatalf("failed to create series: %v", err)
-						}
-
-						// Create main policy and records
-						for policyName, policyRecords := range tc.records {
-							policy := dbSamplingPolicy{
-								TimeSeriesID:  series.ID,
-								Name:          policyName,
-								Precision:     time.Minute,
-								Retention:     24 * time.Hour,
-								AggregationFn: "avg",
-							}
-							if err := store.db.Create(&policy).Error; err != nil {
-								t.Fatalf("failed to create %s policy: %v", policyName, err)
-							}
-
-							// Create records for this policy
-							for _, rec := range policyRecords {
-								dbRec := dbRecord{
-									SamplingId: policy.ID,
-									Time:       rec.Time,
-									Value:      rec.Value,
-								}
-								if err := store.db.Create(&dbRec).Error; err != nil {
-									t.Fatalf("failed to create %s record: %v", policyName, err)
-								}
-							}
-						}
-
-						// Execute ListRecords
-						got, err := store.ListRecords(tc.SeriesName, tc.start, tc.end)
-						if err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-
-						// Add series name to expected records for comparison
-						wantWithSeries := make([]Record, len(tc.want))
-						for i, rec := range tc.want {
-							wantWithSeries[i] = Record{
-								Series: tc.SeriesName,
-								Time:   rec.Time,
-								Value:  rec.Value,
-							}
-						}
-
-						if diff := cmp.Diff(wantWithSeries, got,
-							cmpopts.IgnoreFields(Record{}, "Id"),
-							cmpopts.SortSlices(func(a, b Record) bool {
-								if !a.Time.Equal(b.Time) {
-									return a.Time.Before(b.Time)
-								}
-								return a.Value < b.Value
-							}),
-						); diff != "" {
-							t.Errorf("unexpected result (-want +got):\n%s", diff)
-						}
-					})
-				}
-			})
-		}
-	})
-
-	t.Run("error cases", func(t *testing.T) {
-		tcs := []struct {
-			name       string
-			SeriesName string
-			wantErr    string
-		}{
-			{
-				name:       "error on empty name",
-				SeriesName: "",
-				wantErr:    "series name is required",
-			},
-			{
-				name:       "error on nonexistent series",
-				SeriesName: "nonexistent",
-				wantErr:    "series not found: record not found",
-			},
-		}
-
-		for _, db := range testdbs.DBs() {
-			t.Run(db.DbType(), func(t *testing.T) {
-				for _, tc := range tcs {
-					t.Run(tc.name, func(t *testing.T) {
-						dbCon := db.ConnDbName("TestListRecords_error_" + tc.name)
-						store, err := NewRegistry(dbCon)
-						if err != nil {
-							t.Fatal(err)
-						}
-
-						// Execute ListRecords
-						_, err = store.ListRecords(tc.SeriesName, time.Time{}, time.Time{})
-
-						// Verify error
-						if err == nil {
-							t.Fatalf("expected error %q, got none", tc.wantErr)
-						}
-						if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
-							t.Errorf("unexpected error (-want +got):\n%s", diff)
-						}
-					})
-				}
-			})
-		}
-	})
-}
-
-func TestRecordAt(t *testing.T) {
-	// Main retention has 2025-01-05..2025-01-10. RecordAt returns latest at or before query time.
-	tcs := []struct {
-		name      string
-		series    string
-		queryTime time.Time
-		wantValue float64
-		wantErr   string
-	}{
-		{name: "before any data", series: "btc_price", queryTime: getDateTime("2024-12-01 00:00:00"), wantErr: "record not found"},
-		{name: "exact match main", series: "btc_price", queryTime: getDateTime("2025-01-05 00:00:00"), wantValue: 14000},
-		{name: "within main bucket", series: "btc_price", queryTime: getDateTime("2025-01-05 00:00:00").Add(12 * time.Hour), wantValue: 14000},
-		{name: "between main records", series: "btc_price", queryTime: getDateTime("2025-01-06 00:00:00").Add(12 * time.Hour), wantValue: 15000},
-		{name: "in main range", series: "btc_price", queryTime: getDateTime("2025-01-07 00:00:00"), wantValue: 16000},
-		{name: "after last record", series: "btc_price", queryTime: getDateTime("2025-01-15 00:00:00"), wantValue: 19000},
-		{name: "series not found", series: "unknown_series", queryTime: getDateTime("2025-01-05 00:00:00"), wantErr: "series not found"},
-	}
-
-	for _, db := range testdbs.DBs() {
-		t.Run(db.DbType(), func(t *testing.T) {
-			dbCon := db.ConnDbName("TestRecordAt")
-			store, err := NewRegistry(dbCon)
+// TestLatest_SingleStatementSnapshot guards that Latest reads the newest point in a
+// single SQL statement against the records table, not two. The old implementation ran
+// two queries (find the newest timestamp, then fetch that timestamp's fields) with a
+// gap a concurrent write could slip into — returning a stale point (a newer timestamp
+// landed between the queries) or a torn one. A single MAX(time) subquery read takes a
+// consistent snapshot, closing that window.
+func TestLatest_SingleStatementSnapshot(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestLatestSnapshot"))
 			if err != nil {
 				t.Fatal(err)
 			}
+			ctx := context.Background()
+			setupAAPL(t, s)
 
-			if err := store.RegisterSeries(TimeSeries{
-				Name: "btc_price",
-				Retention: SamplingPolicy{
-					Retention: 7 * 24 * time.Hour,
-					Precision: time.Hour,
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"open": 100, "close": 101, "volume": 1000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"open": 200, "close": 202, "volume": 2000}}); err != nil {
+				t.Fatal(err)
+			}
+
+			recordsTable := (dbRecord{}).TableName()
+			var recordSelects int
+			const cb = "count_record_selects"
+			// Count only real round-trips against the records table. GORM also runs the
+			// MAX(time) subquery's callbacks in DryRun to build its SQL for inlining;
+			// those don't touch the database, so skip them.
+			if err := s.db.Callback().Query().After("gorm:query").Register(cb, func(db *gorm.DB) {
+				if db.Statement.Table == recordsTable && !db.DryRun {
+					recordSelects++
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.db.Callback().Query().Remove(cb) }()
+
+			p, cov, err := s.Latest(ctx, "AAPL")
+			if err != nil || cov != CoverageFull {
+				t.Fatalf("Latest: cov=%v err=%v, want CoverageFull nil", cov, err)
+			}
+			if !p.Time.Equal(day2) || p.Values["open"] != 200 || p.Values["close"] != 202 {
+				t.Fatalf("Latest = {%v %v}, want day2 open=200 close=202", p.Time, p.Values)
+			}
+			if recordSelects != 1 {
+				t.Fatalf("Latest issued %d SELECTs against %q, want 1 (single-statement snapshot; two queries race with concurrent writes)", recordSelects, recordsTable)
+			}
+		})
+	}
+}
+
+// TestLatestField returns the newest (time, value) for one field, with the real
+// timestamp, and found=false when the field has no samples.
+func TestLatestField(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestLatestField"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			if _, found, err := s.LatestField(ctx, "AAPL", "close"); err != nil || found {
+				t.Fatalf("LatestField on empty series: found=%v err=%v, want false nil", found, err)
+			}
+
+			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			day2 := time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day1, Values: map[string]float64{"close": 101}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: day2, Values: map[string]float64{"close": 202}}); err != nil {
+				t.Fatal(err)
+			}
+
+			sm, found, err := s.LatestField(ctx, "AAPL", "close")
+			if err != nil || !found {
+				t.Fatalf("LatestField: found=%v err=%v, want true nil", found, err)
+			}
+			if !sm.Time.Equal(day2) || sm.Value != 202 {
+				t.Fatalf("LatestField = {%v, %v}, want {%v, 202}", sm.Time, sm.Value, day2)
+			}
+
+			if _, _, err := s.LatestField(ctx, "AAPL", "nope"); !errors.Is(err, ErrFieldNotFound) {
+				t.Fatalf("LatestField unknown field err = %v, want ErrFieldNotFound", err)
+			}
+		})
+	}
+}
+
+// TestCount returns the number of distinct timestamps (points) in a series,
+// independent of how many fields each point carries.
+func TestCount(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestCount"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+
+			if n, err := s.Count(ctx, "AAPL"); err != nil || n != 0 {
+				t.Fatalf("Count on empty series = %d, %v, want 0 nil", n, err)
+			}
+
+			// 3 points, each with multiple fields: count is 3 (distinct timestamps),
+			// not 3*fields rows.
+			for i := 0; i < 3; i++ {
+				day := time.Date(2025, 1, 2+i, 0, 0, 0, 0, time.UTC)
+				if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"open": 1, "close": 2, "volume": 3}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			n, err := s.Count(ctx, "AAPL")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != 3 {
+				t.Fatalf("Count = %d, want 3 (distinct timestamps)", n)
+			}
+		})
+	}
+}
+
+// TestCountAll returns distinct-timestamp counts per series in one query,
+// includes zero-record series, and honors MatchLabel filters like ListSeries.
+func TestCountAll(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestCountAll"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			mk := func(name, typ string) Series {
+				return Series{
+					Name: name, Precision: 24 * time.Hour, Retention: 365 * 24 * time.Hour,
+					Fields: []Field{{Name: "open", Aggregate: AggFirst}, {Name: "close", Aggregate: AggLast}},
+					Labels: map[string]string{"type": typ},
+				}
+			}
+			for _, cfg := range []Series{mk("AAPL", "price"), mk("MSFT", "price"), mk("EURUSD", "fx")} {
+				if err := s.DefineSeries(ctx, cfg); err != nil {
+					t.Fatalf("DefineSeries %s: %v", cfg.Name, err)
+				}
+			}
+			// AAPL: 3 points, each with multiple fields → still 3 distinct timestamps.
+			for i := 0; i < 3; i++ {
+				day := time.Date(2025, 1, 2+i, 0, 0, 0, 0, time.UTC)
+				if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"open": 1, "close": 2}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// EURUSD: 1 point. MSFT: no records (must still appear with count 0).
+			if err := s.Write(ctx, "EURUSD", Point{Time: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC), Values: map[string]float64{"close": 1}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// No options -> every series, zero-record series included.
+			all, err := s.CountAll(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string]int{"AAPL": 3, "MSFT": 0, "EURUSD": 1}; !reflect.DeepEqual(all, want) {
+				t.Fatalf("CountAll() = %v, want %v", all, want)
+			}
+
+			// MatchLabel restricts the set like ListSeries.
+			price, err := s.CountAll(ctx, MatchLabel("type", "price"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string]int{"AAPL": 3, "MSFT": 0}; !reflect.DeepEqual(price, want) {
+				t.Fatalf("CountAll(type=price) = %v, want %v", price, want)
+			}
+
+			// No match -> empty, non-nil.
+			none, err := s.CountAll(ctx, MatchLabel("type", "nope"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(none) != 0 {
+				t.Fatalf("CountAll(type=nope) = %v, want empty", none)
+			}
+		})
+	}
+}
+
+func TestWrite_Errors(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestWriteErrors"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			setupAAPL(t, s)
+			ctx := context.Background()
+
+			err = s.Write(ctx, "NOPE", Point{Time: time.Now().UTC(), Values: map[string]float64{"close": 1}})
+			if !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("unknown series error = %v, want ErrSeriesNotFound", err)
+			}
+			err = s.Write(ctx, "AAPL", Point{Time: time.Now().UTC(), Values: map[string]float64{"ghost": 1}})
+			if !errors.Is(err, ErrFieldNotFound) {
+				t.Fatalf("undefined field error = %v, want ErrFieldNotFound", err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: time.Time{}, Values: map[string]float64{"close": 1}}); err == nil {
+				t.Fatal("expected error for zero time")
+			}
+			if err := s.WriteMany(ctx, "AAPL", nil); err != nil {
+				t.Fatalf("empty WriteMany should be no-op, got %v", err)
+			}
+		})
+	}
+}
+
+// TestReadErrors_MissingSeries verifies every read/delete path returns the
+// ErrSeriesNotFound sentinel (errors.Is testable) for an unknown series.
+func TestReadErrors_MissingSeries(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestReadErrMissing"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			now := time.Now().UTC()
+
+			if _, err := s.Range(ctx, "NOPE", time.Time{}, time.Time{}); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("Range err = %v, want ErrSeriesNotFound", err)
+			}
+			if _, err := s.FieldRange(ctx, "NOPE", "v", time.Time{}, time.Time{}); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("FieldRange err = %v, want ErrSeriesNotFound", err)
+			}
+			if _, _, err := s.FieldAt(ctx, "NOPE", "v", now); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("FieldAt err = %v, want ErrSeriesNotFound", err)
+			}
+			if _, _, err := s.At(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("At err = %v, want ErrSeriesNotFound", err)
+			}
+			if _, err := s.Delete(ctx, "NOPE", now); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("Delete err = %v, want ErrSeriesNotFound", err)
+			}
+			if err := s.DeleteRange(ctx, "NOPE", time.Time{}, time.Time{}); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("DeleteRange err = %v, want ErrSeriesNotFound", err)
+			}
+			if err := s.DropSeries(ctx, "NOPE"); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("DropSeries err = %v, want ErrSeriesNotFound", err)
+			}
+			if _, err := s.GetSeries(ctx, "NOPE"); !errors.Is(err, ErrSeriesNotFound) {
+				t.Fatalf("GetSeries err = %v, want ErrSeriesNotFound", err)
+			}
+		})
+	}
+}
+
+// readFixture spins up a fresh Store, defines the AAPL series, and writes the
+// three daily points (d1/d2/d3) shared by all read tests. It returns the store
+// and the three timestamps.
+func readFixture(t *testing.T, s *Store) (d1, d2, d3 time.Time) {
+	t.Helper()
+	setupAAPL(t, s)
+
+	d1 = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	d2 = d1.Add(24 * time.Hour)
+	d3 = d2.Add(24 * time.Hour)
+
+	mustWrite := func(d time.Time, open, closeV, vol float64) {
+		if err := s.Write(context.Background(), "AAPL", Point{Time: d, Values: map[string]float64{
+			"open": open, "close": closeV, "volume": vol,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(d1, 100, 101, 1000)
+	mustWrite(d2, 102, 103, 1100)
+	mustWrite(d3, 104, 105, 1200)
+	return d1, d2, d3
+}
+
+func TestRange(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestRange"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			d1, d2, _ := readFixture(t, s)
+
+			// Range -> pivoted points
+			pts, err := s.Range(context.Background(), "AAPL", d1, d2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pts) != 2 {
+				t.Fatalf("Range len = %d, want 2", len(pts))
+			}
+			if !pts[0].Time.Equal(d1) || pts[0].Values["close"] != 101 || pts[0].Values["open"] != 100 {
+				t.Fatalf("Range[0] = %+v", pts[0])
+			}
+		})
+	}
+}
+
+func TestFieldRange(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestFieldRange"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			d1, _, d3 := readFixture(t, s)
+
+			// FieldRange -> scalar series
+			closes, err := s.FieldRange(context.Background(), "AAPL", "close", d1, d3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(closes) != 3 || closes[0].Value != 101 || closes[2].Value != 105 {
+				t.Fatalf("FieldRange close = %+v", closes)
+			}
+		})
+	}
+}
+
+// TestOpenEndedRanges exercises the documented zero-time unbounded bounds on
+// Range, FieldRange and DeleteRange across all DBs (zero time must omit the
+// bound, not filter on NULL).
+func TestOpenEndedRanges(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestOpenEnded"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			d1, d2, _ := readFixture(t, s)
+
+			// Fully unbounded Range: all three points.
+			pts, err := s.Range(ctx, "AAPL", time.Time{}, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pts) != 3 {
+				t.Fatalf("unbounded Range len = %d, want 3", len(pts))
+			}
+
+			// Unbounded start, bounded end: points up to and including d1.
+			closes, err := s.FieldRange(ctx, "AAPL", "close", time.Time{}, d1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(closes) != 1 || closes[0].Value != 101 {
+				t.Fatalf("FieldRange(.., d1) = %+v, want one sample 101", closes)
+			}
+
+			// Bounded start, unbounded end: points from d2 onward.
+			closes, err = s.FieldRange(ctx, "AAPL", "close", d2, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(closes) != 2 {
+				t.Fatalf("FieldRange(d2, ..) len = %d, want 2", len(closes))
+			}
+
+			// Unbounded start DeleteRange removes d1 and d2, leaving d3.
+			if err := s.DeleteRange(ctx, "AAPL", time.Time{}, d2); err != nil {
+				t.Fatal(err)
+			}
+			rest, err := s.Range(ctx, "AAPL", time.Time{}, time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rest) != 1 {
+				t.Fatalf("after open-ended DeleteRange, points = %d, want 1 (d3 only)", len(rest))
+			}
+		})
+	}
+}
+
+// TestAt_DivergentTimestamps is the case At exists for: fields whose latest
+// values land at different source times. The snapshot must pick each field's
+// own latest value at or before t, independently.
+func TestAt_DivergentTimestamps(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestAtDivergent"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s)
+			d1 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			d2 := d1.Add(24 * time.Hour)
+			d3 := d2.Add(24 * time.Hour)
+
+			// open last written at d1; close last written at d2; volume at d3.
+			if err := s.Write(ctx, "AAPL", Point{Time: d1, Values: map[string]float64{"open": 100}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: d2, Values: map[string]float64{"close": 200}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Write(ctx, "AAPL", Point{Time: d3, Values: map[string]float64{"volume": 300}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// As of d3: each field resolves to its own latest <= d3 — full coverage.
+			snap, cov, err := s.At(ctx, "AAPL", d3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cov != CoverageFull {
+				t.Fatalf("At(d3) coverage = %v, want CoverageFull (all fields resolve <= d3)", cov)
+			}
+			if snap.Values["open"] != 100 || snap.Values["close"] != 200 || snap.Values["volume"] != 300 {
+				t.Fatalf("At(d3) divergent snapshot = %+v, want open=100 close=200 volume=300", snap.Values)
+			}
+
+			// As of d2: volume (only at d3) must be absent; open/close present — a
+			// partial snapshot, reported as CoveragePartial.
+			snap2, cov, err := s.At(ctx, "AAPL", d2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cov != CoveragePartial {
+				t.Fatalf("At(d2) coverage = %v, want CoveragePartial (volume first written at d3)", cov)
+			}
+			if _, ok := snap2.Values["volume"]; ok {
+				t.Fatalf("At(d2) should not include volume (first written at d3): %+v", snap2.Values)
+			}
+			if snap2.Values["open"] != 100 || snap2.Values["close"] != 200 {
+				t.Fatalf("At(d2) = %+v, want open=100 close=200", snap2.Values)
+			}
+
+			// Before the first point: nothing resolves, CoverageNone.
+			if _, cov, err := s.At(ctx, "AAPL", d1.Add(-time.Hour)); err != nil || cov != CoverageNone {
+				t.Fatalf("At(before d1) cov=%v err=%v, want CoverageNone", cov, err)
+			}
+		})
+	}
+}
+
+func TestFieldAt(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestFieldAt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			d1, d2, _ := readFixture(t, s)
+
+			// FieldAt -> latest <= t
+			v, found, err := s.FieldAt(context.Background(), "AAPL", "close", d2.Add(time.Hour))
+			if err != nil || !found || v != 103 {
+				t.Fatalf("FieldAt = %v found=%v err=%v, want 103", v, found, err)
+			}
+			if _, found, _ := s.FieldAt(context.Background(), "AAPL", "close", d1.Add(-time.Hour)); found {
+				t.Fatal("FieldAt before first point should be found=false")
+			}
+		})
+	}
+}
+
+func TestAt(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestAt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, d2, _ := readFixture(t, s)
+
+			// At -> as-of snapshot of all fields
+			snap, cov, err := s.At(context.Background(), "AAPL", d2.Add(time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cov != CoverageFull {
+				t.Fatalf("At coverage = %v, want CoverageFull", cov)
+			}
+			if snap.Values["close"] != 103 || snap.Values["open"] != 102 || snap.Values["volume"] != 1100 {
+				t.Fatalf("At snapshot = %+v", snap.Values)
+			}
+		})
+	}
+}
+
+// TestCoverage_FieldAddedLater is the schema-evolution case: a field added to a
+// series after data exists has no records at older timestamps, so both At and
+// Latest report CoveragePartial there until that field is written.
+func TestCoverage_FieldAddedLater(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestCoverageFieldAdded"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s) // fields: open, close, volume
+
+			day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{
+				"open": 100, "close": 101, "volume": 1000,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// All three defined fields present -> full, for both reads.
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoverageFull {
+				t.Fatalf("At before field add: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageFull {
+				t.Fatalf("Latest before field add: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+
+			// Add a fourth field; the existing candle has no value for it.
+			if err := s.DefineSeries(ctx, Series{
+				Name:      "AAPL",
+				Precision: 24 * time.Hour,
+				Retention: 365 * 24 * time.Hour,
+				Fields: []Field{
+					{Name: "open", Aggregate: AggFirst},
+					{Name: "close", Aggregate: AggLast},
+					{Name: "volume", Aggregate: AggSum},
+					{Name: "high", Aggregate: AggMax},
 				},
 			}); err != nil {
-				t.Fatalf("failed to register series: %v", err)
+				t.Fatal(err)
 			}
 
-			for _, r := range testRecords {
-				if r.Time.Before(getDateTime("2025-01-05 00:00:00")) {
-					continue
-				}
-				if _, err := store.Ingest(r.Series, r.Time, r.Value); err != nil {
-					t.Fatalf("failed to ingest record %v: %v", r, err)
+			// Now 3 of 4 defined fields resolve -> partial, for both reads.
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoveragePartial {
+				t.Fatalf("At after field add: cov=%v err=%v, want CoveragePartial", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoveragePartial {
+				t.Fatalf("Latest after field add: cov=%v err=%v, want CoveragePartial", cov, err)
+			}
+
+			// Writing the missing field restores full coverage.
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"high": 110}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoverageFull {
+				t.Fatalf("At after backfill: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageFull {
+				t.Fatalf("Latest after backfill: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+		})
+	}
+}
+
+// TestCoverage_String checks the human-readable forms used in test/log output.
+func TestCoverage_String(t *testing.T) {
+	cases := map[Coverage]string{
+		CoverageNone:    "none",
+		CoveragePartial: "partial",
+		CoverageFull:    "full",
+		Coverage(99):    "Coverage(99)",
+	}
+	for c, want := range cases {
+		if got := c.String(); got != want {
+			t.Errorf("Coverage(%d).String() = %q, want %q", int(c), got, want)
+		}
+	}
+}
+
+func TestDeletes(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestDeletes"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			setupAAPL(t, s)
+			d1 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			d2 := d1.Add(24 * time.Hour)
+			d3 := d2.Add(24 * time.Hour)
+			for _, d := range []time.Time{d1, d2, d3} {
+				if err := s.Write(context.Background(), "AAPL", Point{Time: d, Values: map[string]float64{"close": 1, "open": 1}}); err != nil {
+					t.Fatal(err)
 				}
 			}
 
-			for _, tc := range tcs {
-				t.Run(tc.name, func(t *testing.T) {
-					got, err := store.RecordAt(tc.series, tc.queryTime)
-					if tc.wantErr != "" {
-						if err == nil {
-							t.Fatalf("expected error %q but got none", tc.wantErr)
-						}
-						if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
-							t.Errorf("unexpected error (-want +got):\n%s", diff)
-						}
-						return
-					}
-					if err != nil {
-						t.Fatalf("unexpected error: %v", err)
-					}
-					if got.Value != tc.wantValue {
-						t.Errorf("unexpected value: want %.2f, got %.2f", tc.wantValue, got.Value)
-					}
-				})
+			// Delete one point (all its fields); a matching record reports deleted=true
+			deleted, err := s.Delete(context.Background(), "AAPL", d2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !deleted {
+				t.Fatalf("Delete(d2) deleted = false, want true")
+			}
+			var c int64
+			if err := s.db.Model(&dbRecord{}).Where("time = ?", unixMilli(d2)).Count(&c).Error; err != nil {
+				t.Fatal(err)
+			}
+			if c != 0 {
+				t.Fatalf("after Delete(d2) count = %d, want 0", c)
+			}
+
+			// Deleting the now-empty timestamp again is a no-op: deleted=false, nil error
+			deleted, err = s.Delete(context.Background(), "AAPL", d2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deleted {
+				t.Fatalf("re-Delete(d2) deleted = true, want false")
+			}
+
+			// DeleteRange removes d1 (and would remove d2 if present)
+			if err := s.DeleteRange(context.Background(), "AAPL", d1, d2); err != nil {
+				t.Fatal(err)
+			}
+			var total int64
+			if err := s.db.Model(&dbRecord{}).Count(&total).Error; err != nil {
+				t.Fatal(err)
+			}
+			if total != 2 { // only d3's two fields remain
+				t.Fatalf("after DeleteRange count = %d, want 2", total)
+			}
+
+			// DropSeries cascade
+			if err := s.DropSeries(context.Background(), "AAPL"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Model(&dbRecord{}).Count(&total).Error; err != nil {
+				t.Fatal(err)
+			}
+			if total != 0 {
+				t.Fatalf("after DropSeries cascade count = %d, want 0", total)
+			}
+			var fieldsLeft int64
+			if err := s.db.Model(&dbField{}).Count(&fieldsLeft).Error; err != nil {
+				t.Fatal(err)
+			}
+			if fieldsLeft != 0 {
+				t.Fatalf("after DropSeries field count = %d, want 0 (fields must cascade)", fieldsLeft)
+			}
+		})
+	}
+}
+
+func TestPerSeriesFieldIndependence(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestPerSeriesFieldIndep"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			long := 100 * 365 * 24 * time.Hour
+			if err := s.DefineSeries(context.Background(), Series{
+				Name: "A", Precision: 24 * time.Hour, Retention: long,
+				Fields: []Field{{Name: "v", Aggregate: AggMax}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DefineSeries(context.Background(), Series{
+				Name: "B", Precision: 24 * time.Hour, Retention: long,
+				Fields: []Field{{Name: "v", Aggregate: AggMin}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			write := func(series string) {
+				if err := s.WriteMany(context.Background(), series, []Point{
+					{Time: day.Add(9 * time.Hour), Values: map[string]float64{"v": 10}},
+					{Time: day.Add(16 * time.Hour), Values: map[string]float64{"v": 20}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("A")
+			write("B")
+
+			if err := s.Maintain(context.Background()); err != nil {
+				t.Fatalf("Maintain: %v", err)
+			}
+
+			va, _, _ := s.FieldAt(context.Background(), "A", "v", day.Add(24*time.Hour))
+			vb, _, _ := s.FieldAt(context.Background(), "B", "v", day.Add(24*time.Hour))
+			if va != 20 {
+				t.Fatalf("A.v = %v, want 20 (max)", va)
+			}
+			if vb != 10 {
+				t.Fatalf("B.v = %v, want 10 (min)", vb)
 			}
 		})
 	}

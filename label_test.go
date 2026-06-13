@@ -13,7 +13,7 @@ import (
 func TestSeriesLabelsTableMigrated(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestSeriesLabelsTableMigrated"))
+			s, err := New(connDB(t, tdb,"TestSeriesLabelsTableMigrated"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -28,7 +28,7 @@ func TestSeriesLabelsTableMigrated(t *testing.T) {
 func TestDefineSeries_RoundTripsLabels(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesRoundTripsLabels"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesRoundTripsLabels"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -56,7 +56,7 @@ func TestDefineSeries_RoundTripsLabels(t *testing.T) {
 func TestDefineSeries_RejectsEmptyLabelKey(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesRejectsEmptyLabelKey"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesRejectsEmptyLabelKey"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +76,7 @@ func TestDefineSeries_RejectsEmptyLabelKey(t *testing.T) {
 func TestDefineSeries_LabelsDeclarativeSync(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesLabelsDeclarativeSync"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesLabelsDeclarativeSync"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -113,7 +113,7 @@ func TestDefineSeries_LabelsDeclarativeSync(t *testing.T) {
 func TestDefineSeries_UnchangedWithLabelsSkipsWriteLock(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesUnchangedWithLabels"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesUnchangedWithLabels"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +146,7 @@ func TestDefineSeries_UnchangedWithLabelsSkipsWriteLock(t *testing.T) {
 func TestListSeries_FilterByLabel(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestListSeriesFilterByLabel"))
+			s, err := New(connDB(t, tdb,"TestListSeriesFilterByLabel"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -210,7 +210,7 @@ func TestListSeries_FilterByLabel(t *testing.T) {
 func TestDropSeries_RemovesLabels(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDropSeriesRemovesLabels"))
+			s, err := New(connDB(t, tdb,"TestDropSeriesRemovesLabels"))
 			if err != nil {
 				t.Fatal(err)
 			}

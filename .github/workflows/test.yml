@@ -1,0 +1,20 @@
+name: golang
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: run tests
+        run: make test
+
+      - name: ensure test coverage
+        run: make coverage

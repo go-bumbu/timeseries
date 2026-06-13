@@ -24,7 +24,7 @@ func TestMain(m *testing.M) {
 func TestMigrations(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			db := tdb.ConnDbName("TestMigrations")
+			db := connDB(t, tdb,"TestMigrations")
 			s, err := New(db)
 			if err != nil {
 				t.Fatalf("New: %v", err)
@@ -51,12 +51,64 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
+// TestNew_ReMigrationIdempotent guards the common re-open path: New runs
+// AutoMigrate on every call, and the records table is WITHOUT ROWID on SQLite
+// (which cannot be ALTERed into existence after the fact). A second New on a
+// populated database must therefore be a clean no-op — no error, existing data
+// intact, and the records table still clustered WITHOUT ROWID, not silently
+// rebuilt as a rowid table.
+func TestNew_ReMigrationIdempotent(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			db := connDB(t, tdb,"TestReMigrate")
+			s, err := New(db)
+			if err != nil {
+				t.Fatalf("first New: %v", err)
+			}
+			ctx := context.Background()
+			if err := s.DefineSeries(ctx, Series{
+				Name: "AAPL", Precision: 24 * time.Hour, Retention: 365 * 24 * time.Hour,
+				Fields: []Field{{Name: "close", Aggregate: AggLast}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"close": 101}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Re-migrate the same database.
+			s2, err := New(db)
+			if err != nil {
+				t.Fatalf("second New (re-migration) failed: %v", err)
+			}
+
+			v, found, err := s2.FieldAt(ctx, "AAPL", "close", day)
+			if err != nil || !found || v != 101 {
+				t.Fatalf("after re-migration FieldAt = %v found=%v err=%v, want 101 (data must survive)", v, found, err)
+			}
+
+			if s2.db.Name() == "sqlite" {
+				var ddl string
+				if err := s2.db.Raw(
+					`SELECT sql FROM sqlite_master WHERE type='table' AND name='records'`,
+				).Scan(&ddl).Error; err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(ddl, "WITHOUT ROWID") {
+					t.Fatalf("records lost WITHOUT ROWID after re-migration: %s", ddl)
+				}
+			}
+		})
+	}
+}
+
 // TestWipe verifies that Wipe removes every series, field, and record across
 // all series in one shot, leaving the three tables empty.
 func TestWipe(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestWipe"))
+			s, err := New(connDB(t, tdb,"TestWipe"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,7 +200,7 @@ func TestNew_NilDB(t *testing.T) {
 func TestContextCancellation(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestCtxCancel"))
+			s, err := New(connDB(t, tdb,"TestCtxCancel"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -180,7 +232,7 @@ func TestContextCancellation(t *testing.T) {
 // Go-level lock discipline from driver busy-retry semantics. Concurrent-write
 // behavior on PostgreSQL/MySQL is not exercised here.
 func TestConcurrentAccess(t *testing.T) {
-	s, err := New(testdbs.DBs()[0].ConnDbName("TestConcurrent"))
+	s, err := New(connDB(t, testdbs.DBs()[0], "TestConcurrent"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +271,7 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
-				ts := base.Add(time.Duration(w*1000+i) * time.Minute)
-				report(s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"v": float64(i)}}))
-			}
+			concurrentWriteStable(ctx, s, w, base, iters, report)
 		}(w)
 	}
 	// dropped-field writer: "tmp" may be absent, so ErrFieldNotFound is a
@@ -230,13 +279,7 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < iters; i++ {
-			ts := base.Add(time.Duration(5000+i) * time.Minute)
-			err := s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"tmp": float64(i)}})
-			if err != nil && !errors.Is(err, ErrFieldNotFound) {
-				report(err)
-			}
-		}
+		concurrentWriteDropped(ctx, s, base, iters, report)
 	}()
 	// readers: a pivoted Point must never contain an orphan (empty-name) field,
 	// which is exactly what a record pointing at a dropped field id would yield.
@@ -244,32 +287,14 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
-				pts, err := s.Range(ctx, "C", time.Time{}, time.Time{})
-				if err != nil {
-					report(err)
-					continue
-				}
-				for _, p := range pts {
-					if _, orphan := p.Values[""]; orphan {
-						report(fmt.Errorf("orphan record observed: %+v", p.Values))
-					}
-				}
-			}
+			concurrentReadNoOrphan(ctx, s, iters, report)
 		}()
 	}
 	// definer toggles the "tmp" field; maintainer reduces concurrently.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < iters; i++ {
-			if i%2 == 0 {
-				report(s.DefineSeries(ctx, defWithout))
-			} else {
-				report(s.DefineSeries(ctx, defWith))
-			}
-			report(s.Maintain(ctx))
-		}
+		concurrentToggleDefine(ctx, s, defWith, defWithout, iters, report)
 	}()
 
 	wg.Wait()
@@ -277,6 +302,61 @@ func TestConcurrentAccess(t *testing.T) {
 		t.Fatalf("concurrent operations failed (%d): %v", len(errs), errs)
 	}
 
+	verifyConcurrentSettled(t, ctx, s, defWithout)
+}
+
+// concurrentWriteStable writes the always-present "v" field; every write must succeed.
+func concurrentWriteStable(ctx context.Context, s *Store, w int, base time.Time, iters int, report func(error)) {
+	for i := 0; i < iters; i++ {
+		ts := base.Add(time.Duration(w*1000+i) * time.Minute)
+		report(s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"v": float64(i)}}))
+	}
+}
+
+// concurrentWriteDropped writes the toggled "tmp" field; ErrFieldNotFound is a
+// legitimate race outcome and is tolerated, anything else is a bug.
+func concurrentWriteDropped(ctx context.Context, s *Store, base time.Time, iters int, report func(error)) {
+	for i := 0; i < iters; i++ {
+		ts := base.Add(time.Duration(5000+i) * time.Minute)
+		err := s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"tmp": float64(i)}})
+		if err != nil && !errors.Is(err, ErrFieldNotFound) {
+			report(err)
+		}
+	}
+}
+
+// concurrentReadNoOrphan ranges the series and reports any orphan (empty-name) field.
+func concurrentReadNoOrphan(ctx context.Context, s *Store, iters int, report func(error)) {
+	for i := 0; i < iters; i++ {
+		pts, err := s.Range(ctx, "C", time.Time{}, time.Time{})
+		if err != nil {
+			report(err)
+			continue
+		}
+		for _, p := range pts {
+			if _, orphan := p.Values[""]; orphan {
+				report(fmt.Errorf("orphan record observed: %+v", p.Values))
+			}
+		}
+	}
+}
+
+// concurrentToggleDefine toggles the "tmp" field on and off while maintaining concurrently.
+func concurrentToggleDefine(ctx context.Context, s *Store, defWith, defWithout Series, iters int, report func(error)) {
+	for i := 0; i < iters; i++ {
+		if i%2 == 0 {
+			report(s.DefineSeries(ctx, defWithout))
+		} else {
+			report(s.DefineSeries(ctx, defWith))
+		}
+		report(s.Maintain(ctx))
+	}
+}
+
+// verifyConcurrentSettled settles the series to defWithout and asserts no orphan
+// or dropped-field records survive and that reduction is idempotent.
+func verifyConcurrentSettled(t *testing.T, ctx context.Context, s *Store, defWithout Series) {
+	t.Helper()
 	// Settle to a known schema (drops "tmp" and its records) and reduce.
 	if err := s.DefineSeries(ctx, defWithout); err != nil {
 		t.Fatal(err)
@@ -315,5 +395,100 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	if before != after {
 		t.Fatalf("Maintain not idempotent after settle: %d -> %d rows", before, after)
+	}
+}
+
+// TestConcurrentAccess_PooledConnections complements TestConcurrentAccess (which
+// pins a single connection) by raising the pool so point writes — which take only
+// the shared read lock — can reach the database on several connections at once.
+// It asserts the invariants the in-process lock must hold even with real pool
+// contention: no reader ever observes an orphan (empty-name) field, and every
+// distinct timestamp written survives exactly once (upsert, no lost or duplicated
+// writes). Runs across the whole DB matrix; on the server DBs this is the only
+// test that exercises genuinely concurrent writes.
+func TestConcurrentAccess_PooledConnections(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestConcurrentPooled"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sqlDB, err := s.db.DB(); err == nil {
+				sqlDB.SetMaxOpenConns(4)
+			}
+			// SQLite serializes writers at the file level; wait rather than erroring
+			// so the test measures concurrency, not busy-retry noise. No-op elsewhere.
+			if s.db.Name() == "sqlite" {
+				_ = s.db.Exec("PRAGMA busy_timeout = 10000").Error
+			}
+			ctx := context.Background()
+			const long = 100 * 365 * 24 * time.Hour
+			if err := s.DefineSeries(ctx, Series{
+				Name: "C", Precision: time.Hour, Retention: long,
+				Fields: []Field{{Name: "v", Aggregate: AggMax}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+			const writers = 4
+			const iters = 100
+			var wg sync.WaitGroup
+			var errMu sync.Mutex
+			var fatal []error
+			report := func(err error) {
+				errMu.Lock()
+				fatal = append(fatal, err)
+				errMu.Unlock()
+			}
+
+			// Writers on a stable field must always succeed: the field never churns,
+			// so the only contention is the connection pool plus the in-process lock.
+			// Each writer owns a disjoint timestamp range, so the total is exact.
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					for i := 0; i < iters; i++ {
+						ts := base.Add(time.Duration(w*iters+i) * time.Minute)
+						if err := s.Write(ctx, "C", Point{Time: ts, Values: map[string]float64{"v": float64(i)}}); err != nil {
+							report(err)
+						}
+					}
+				}(w)
+			}
+			// Readers: a pivoted point must never expose an orphan (empty-name) field.
+			for r := 0; r < 2; r++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; i < iters; i++ {
+						pts, err := s.Range(ctx, "C", time.Time{}, time.Time{})
+						if err != nil {
+							report(err)
+							continue
+						}
+						for _, p := range pts {
+							if _, orphan := p.Values[""]; orphan {
+								report(fmt.Errorf("orphan field observed under pool: %+v", p.Values))
+							}
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if len(fatal) > 0 {
+				t.Fatalf("pooled concurrent access failed (%d): %v", len(fatal), fatal[0])
+			}
+
+			// Every distinct timestamp written survived exactly once.
+			n, err := s.Count(ctx, "C")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := writers * iters; n != want {
+				t.Fatalf("distinct points = %d, want %d (pool dropped or duplicated writes)", n, want)
+			}
+		})
 	}
 }

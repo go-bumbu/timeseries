@@ -69,3 +69,22 @@ changing storage, the public API, or aggregation.
 - Test-first (TDD). Run behavioral tests against all DBs in `testdbs.DBs()`.
 - Keep the p90 timing harness in `timeseries_bench_test.go`; guard storage footprint
   (~20 B/row on SQLite) against rowid-table / text-time regressions.
+
+## CI & multi-DB testing (ACCEPTED RISK)
+
+- **CI only runs the SQLite backend, not the full multi-DB matrix.** `make verify`
+  (the `.github/workflows/verify.yml` job) runs `go test` without `-alldbs`, and
+  `testdbs.InitDBS()` registers only pure-Go SQLite by default. Postgres, MySQL, and
+  CGo SQLite are in the `-alldbs` / `TESTDBS_ALL` long set and are therefore **never
+  exercised in CI**. Wiring Postgres/MySQL service containers into GitHub Actions is
+  deferred for now due to the setup complexity — this is a **knowingly accepted risk**,
+  not an oversight.
+- **Consequence:** dialect-specific code paths are unverified in automation — the
+  raw correlated-subquery SQL in `At`, cross-dialect `OnConflict` upsert semantics,
+  the reserved-word-dodging `label_key`/`label_value` columns, `BIGINT` vs `INTEGER`
+  time columns, and the `WITHOUT ROWID` gating. The `for _, tdb := range testdbs.DBs()`
+  loops in the tests cover these in principle, but only when run with `-alldbs`.
+- **Enforced at tag time:** the `make tag` target depends on `test-alldbs`, so the full
+  matrix runs (and must pass) before any release tag is created. This needs Docker
+  available locally for the Postgres/MySQL test containers — `make tag` will fail without
+  it. A green CI run is **not** sufficient sign-off for a tag; it has only proven SQLite.

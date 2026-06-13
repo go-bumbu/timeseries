@@ -30,7 +30,7 @@ func setupAAPL(t *testing.T, s *Store) {
 func TestWrite_Upsert(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestWriteUpsert"))
+			s, err := New(connDB(t, tdb,"TestWriteUpsert"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -73,16 +73,16 @@ func TestWrite_Upsert(t *testing.T) {
 func TestLatest(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestLatest"))
+			s, err := New(connDB(t, tdb,"TestLatest"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx := context.Background()
 			setupAAPL(t, s)
 
-			// Empty series: found=false, no error.
-			if _, found, err := s.Latest(ctx, "AAPL"); err != nil || found {
-				t.Fatalf("Latest on empty series: found=%v err=%v, want found=false nil", found, err)
+			// Empty series: CoverageNone, no error.
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageNone {
+				t.Fatalf("Latest on empty series: cov=%v err=%v, want CoverageNone nil", cov, err)
 			}
 
 			day1 := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
@@ -94,9 +94,9 @@ func TestLatest(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			p, found, err := s.Latest(ctx, "AAPL")
-			if err != nil || !found {
-				t.Fatalf("Latest: found=%v err=%v, want true nil", found, err)
+			p, cov, err := s.Latest(ctx, "AAPL")
+			if err != nil || cov != CoverageFull {
+				t.Fatalf("Latest: cov=%v err=%v, want CoverageFull nil", cov, err)
 			}
 			if !p.Time.Equal(day2) {
 				t.Fatalf("Latest time = %v, want %v (real timestamp, not query time)", p.Time, day2)
@@ -122,7 +122,7 @@ func TestLatest(t *testing.T) {
 func TestLatest_SingleStatementSnapshot(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestLatestSnapshot"))
+			s, err := New(connDB(t, tdb,"TestLatestSnapshot"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -153,9 +153,9 @@ func TestLatest_SingleStatementSnapshot(t *testing.T) {
 			}
 			defer func() { _ = s.db.Callback().Query().Remove(cb) }()
 
-			p, found, err := s.Latest(ctx, "AAPL")
-			if err != nil || !found {
-				t.Fatalf("Latest: found=%v err=%v, want true nil", found, err)
+			p, cov, err := s.Latest(ctx, "AAPL")
+			if err != nil || cov != CoverageFull {
+				t.Fatalf("Latest: cov=%v err=%v, want CoverageFull nil", cov, err)
 			}
 			if !p.Time.Equal(day2) || p.Values["open"] != 200 || p.Values["close"] != 202 {
 				t.Fatalf("Latest = {%v %v}, want day2 open=200 close=202", p.Time, p.Values)
@@ -172,7 +172,7 @@ func TestLatest_SingleStatementSnapshot(t *testing.T) {
 func TestLatestField(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestLatestField"))
+			s, err := New(connDB(t, tdb,"TestLatestField"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,7 +212,7 @@ func TestLatestField(t *testing.T) {
 func TestCount(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestCount"))
+			s, err := New(connDB(t, tdb,"TestCount"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -247,7 +247,7 @@ func TestCount(t *testing.T) {
 func TestCountAll(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestCountAll"))
+			s, err := New(connDB(t, tdb,"TestCountAll"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -309,18 +309,18 @@ func TestCountAll(t *testing.T) {
 func TestWrite_Errors(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestWriteErrors"))
+			s, err := New(connDB(t, tdb,"TestWriteErrors"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			setupAAPL(t, s)
 			ctx := context.Background()
 
-			err = s.Write(ctx, "NOPE", Point{Time: time.Now(), Values: map[string]float64{"close": 1}})
+			err = s.Write(ctx, "NOPE", Point{Time: time.Now().UTC(), Values: map[string]float64{"close": 1}})
 			if !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("unknown series error = %v, want ErrSeriesNotFound", err)
 			}
-			err = s.Write(ctx, "AAPL", Point{Time: time.Now(), Values: map[string]float64{"ghost": 1}})
+			err = s.Write(ctx, "AAPL", Point{Time: time.Now().UTC(), Values: map[string]float64{"ghost": 1}})
 			if !errors.Is(err, ErrFieldNotFound) {
 				t.Fatalf("undefined field error = %v, want ErrFieldNotFound", err)
 			}
@@ -339,12 +339,12 @@ func TestWrite_Errors(t *testing.T) {
 func TestReadErrors_MissingSeries(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestReadErrMissing"))
+			s, err := New(connDB(t, tdb,"TestReadErrMissing"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx := context.Background()
-			now := time.Now()
+			now := time.Now().UTC()
 
 			if _, err := s.Range(ctx, "NOPE", time.Time{}, time.Time{}); !errors.Is(err, ErrSeriesNotFound) {
 				t.Fatalf("Range err = %v, want ErrSeriesNotFound", err)
@@ -401,7 +401,7 @@ func readFixture(t *testing.T, s *Store) (d1, d2, d3 time.Time) {
 func TestRange(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestRange"))
+			s, err := New(connDB(t, tdb,"TestRange"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -425,7 +425,7 @@ func TestRange(t *testing.T) {
 func TestFieldRange(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestFieldRange"))
+			s, err := New(connDB(t, tdb,"TestFieldRange"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -449,7 +449,7 @@ func TestFieldRange(t *testing.T) {
 func TestOpenEndedRanges(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestOpenEnded"))
+			s, err := New(connDB(t, tdb,"TestOpenEnded"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -504,7 +504,7 @@ func TestOpenEndedRanges(t *testing.T) {
 func TestAt_DivergentTimestamps(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestAtDivergent"))
+			s, err := New(connDB(t, tdb,"TestAtDivergent"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -525,26 +525,26 @@ func TestAt_DivergentTimestamps(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// As of d3: each field resolves to its own latest <= d3.
-			snap, found, err := s.At(ctx, "AAPL", d3)
+			// As of d3: each field resolves to its own latest <= d3 — full coverage.
+			snap, cov, err := s.At(ctx, "AAPL", d3)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !found {
-				t.Fatal("At(d3) found = false, want true")
+			if cov != CoverageFull {
+				t.Fatalf("At(d3) coverage = %v, want CoverageFull (all fields resolve <= d3)", cov)
 			}
 			if snap.Values["open"] != 100 || snap.Values["close"] != 200 || snap.Values["volume"] != 300 {
 				t.Fatalf("At(d3) divergent snapshot = %+v, want open=100 close=200 volume=300", snap.Values)
 			}
 
-			// As of d2: volume (only at d3) must be absent; open/close present.
-			// A partial snapshot (best-effort per-field) is still found=true.
-			snap2, found, err := s.At(ctx, "AAPL", d2)
+			// As of d2: volume (only at d3) must be absent; open/close present — a
+			// partial snapshot, reported as CoveragePartial.
+			snap2, cov, err := s.At(ctx, "AAPL", d2)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !found {
-				t.Fatal("At(d2) found = false, want true (partial snapshot is still found)")
+			if cov != CoveragePartial {
+				t.Fatalf("At(d2) coverage = %v, want CoveragePartial (volume first written at d3)", cov)
 			}
 			if _, ok := snap2.Values["volume"]; ok {
 				t.Fatalf("At(d2) should not include volume (first written at d3): %+v", snap2.Values)
@@ -553,9 +553,9 @@ func TestAt_DivergentTimestamps(t *testing.T) {
 				t.Fatalf("At(d2) = %+v, want open=100 close=200", snap2.Values)
 			}
 
-			// Before the first point: nothing resolves, found=false.
-			if _, found, err := s.At(ctx, "AAPL", d1.Add(-time.Hour)); err != nil || found {
-				t.Fatalf("At(before d1) found=%v err=%v, want found=false", found, err)
+			// Before the first point: nothing resolves, CoverageNone.
+			if _, cov, err := s.At(ctx, "AAPL", d1.Add(-time.Hour)); err != nil || cov != CoverageNone {
+				t.Fatalf("At(before d1) cov=%v err=%v, want CoverageNone", cov, err)
 			}
 		})
 	}
@@ -564,7 +564,7 @@ func TestAt_DivergentTimestamps(t *testing.T) {
 func TestFieldAt(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestFieldAt"))
+			s, err := New(connDB(t, tdb,"TestFieldAt"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -585,19 +585,19 @@ func TestFieldAt(t *testing.T) {
 func TestAt(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestAt"))
+			s, err := New(connDB(t, tdb,"TestAt"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			_, d2, _ := readFixture(t, s)
 
 			// At -> as-of snapshot of all fields
-			snap, found, err := s.At(context.Background(), "AAPL", d2.Add(time.Hour))
+			snap, cov, err := s.At(context.Background(), "AAPL", d2.Add(time.Hour))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !found {
-				t.Fatal("At found = false, want true")
+			if cov != CoverageFull {
+				t.Fatalf("At coverage = %v, want CoverageFull", cov)
 			}
 			if snap.Values["close"] != 103 || snap.Values["open"] != 102 || snap.Values["volume"] != 1100 {
 				t.Fatalf("At snapshot = %+v", snap.Values)
@@ -606,10 +606,90 @@ func TestAt(t *testing.T) {
 	}
 }
 
+// TestCoverage_FieldAddedLater is the schema-evolution case: a field added to a
+// series after data exists has no records at older timestamps, so both At and
+// Latest report CoveragePartial there until that field is written.
+func TestCoverage_FieldAddedLater(t *testing.T) {
+	for _, tdb := range testdbs.DBs() {
+		t.Run(tdb.DbType(), func(t *testing.T) {
+			s, err := New(connDB(t, tdb,"TestCoverageFieldAdded"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			setupAAPL(t, s) // fields: open, close, volume
+
+			day := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{
+				"open": 100, "close": 101, "volume": 1000,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+
+			// All three defined fields present -> full, for both reads.
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoverageFull {
+				t.Fatalf("At before field add: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageFull {
+				t.Fatalf("Latest before field add: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+
+			// Add a fourth field; the existing candle has no value for it.
+			if err := s.DefineSeries(ctx, Series{
+				Name:      "AAPL",
+				Precision: 24 * time.Hour,
+				Retention: 365 * 24 * time.Hour,
+				Fields: []Field{
+					{Name: "open", Aggregate: AggFirst},
+					{Name: "close", Aggregate: AggLast},
+					{Name: "volume", Aggregate: AggSum},
+					{Name: "high", Aggregate: AggMax},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Now 3 of 4 defined fields resolve -> partial, for both reads.
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoveragePartial {
+				t.Fatalf("At after field add: cov=%v err=%v, want CoveragePartial", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoveragePartial {
+				t.Fatalf("Latest after field add: cov=%v err=%v, want CoveragePartial", cov, err)
+			}
+
+			// Writing the missing field restores full coverage.
+			if err := s.Write(ctx, "AAPL", Point{Time: day, Values: map[string]float64{"high": 110}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, cov, err := s.At(ctx, "AAPL", day); err != nil || cov != CoverageFull {
+				t.Fatalf("At after backfill: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+			if _, cov, err := s.Latest(ctx, "AAPL"); err != nil || cov != CoverageFull {
+				t.Fatalf("Latest after backfill: cov=%v err=%v, want CoverageFull", cov, err)
+			}
+		})
+	}
+}
+
+// TestCoverage_String checks the human-readable forms used in test/log output.
+func TestCoverage_String(t *testing.T) {
+	cases := map[Coverage]string{
+		CoverageNone:    "none",
+		CoveragePartial: "partial",
+		CoverageFull:    "full",
+		Coverage(99):    "Coverage(99)",
+	}
+	for c, want := range cases {
+		if got := c.String(); got != want {
+			t.Errorf("Coverage(%d).String() = %q, want %q", int(c), got, want)
+		}
+	}
+}
+
 func TestDeletes(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDeletes"))
+			s, err := New(connDB(t, tdb,"TestDeletes"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -684,7 +764,7 @@ func TestDeletes(t *testing.T) {
 func TestPerSeriesFieldIndependence(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestPerSeriesFieldIndep"))
+			s, err := New(connDB(t, tdb,"TestPerSeriesFieldIndep"))
 			if err != nil {
 				t.Fatal(err)
 			}

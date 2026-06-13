@@ -11,7 +11,7 @@ import (
 func TestDefineSeries_FieldSync(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestFieldSync"))
+			s, err := New(connDB(t, tdb,"TestFieldSync"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +82,7 @@ func TestDefineSeries_FieldSync(t *testing.T) {
 func TestDefineSeries_UnknownAggregate(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestFieldBadAgg"))
+			s, err := New(connDB(t, tdb,"TestFieldBadAgg"))
 			if err != nil {
 				t.Fatal(err)
 			}

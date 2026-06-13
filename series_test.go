@@ -12,7 +12,7 @@ import (
 func TestDefineSeries(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeries"))
+			s, err := New(connDB(t, tdb,"TestDefineSeries"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +59,7 @@ func TestDefineSeries(t *testing.T) {
 func TestDefineSeries_UnchangedSkipsWriteLock(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesUnchanged"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesUnchanged"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,7 +95,7 @@ func TestDefineSeries_UnchangedSkipsWriteLock(t *testing.T) {
 func TestDefineSeries_ChangeStillApplies(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesChange"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesChange"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -129,7 +129,7 @@ func TestDefineSeries_ChangeStillApplies(t *testing.T) {
 func TestDefineSeries_Validation(t *testing.T) {
 	for _, tdb := range testdbs.DBs() {
 		t.Run(tdb.DbType(), func(t *testing.T) {
-			s, err := New(tdb.ConnDbName("TestDefineSeriesBad"))
+			s, err := New(connDB(t, tdb,"TestDefineSeriesBad"))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -36,11 +36,11 @@ func TestTiming(t *testing.T) {
 		t.Run(tdb.DbType(), func(t *testing.T) {
 			var ingestDurs, retrieveDurs []time.Duration
 			for run := 0; run < timingNumRuns; run++ {
-				s, err := New(tdb.ConnDbName("TestTiming_" + strconv.Itoa(run)))
+				s, err := New(connDB(t, tdb,"TestTiming_" + strconv.Itoa(run)))
 				if err != nil {
 					t.Fatal(err)
 				}
-				base := time.Now().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
+				base := time.Now().UTC().Truncate(time.Hour).Add(-time.Duration(run) * 365 * 24 * time.Hour)
 				if err := s.DefineSeries(context.Background(), Series{
 					Name: "ts", Precision: time.Hour, Retention: 365 * 24 * time.Hour,
 					Fields: []Field{{Name: "v", Aggregate: AggAvg}},

@@ -11,6 +11,11 @@ import (
 // reduceChunkBuckets controls how many precision buckets are loaded per query.
 const reduceChunkBuckets = 100
 
+// nowFunc returns the current time used to compute the retention cutoff. It is a
+// package-level seam so tests can pin the cutoff deterministically; production
+// code never overrides it.
+var nowFunc = time.Now
+
 // Maintain runs retention cleanup and per-field bucket reduction for all series.
 // Errors are collected per series; it does not stop on the first failure.
 //
@@ -40,7 +45,7 @@ func (s *Store) Maintain(ctx context.Context) error {
 
 // cleanRetention deletes records older than the series retention.
 func (s *Store) cleanRetention(ctx context.Context, ser dbSeries) error {
-	cutoff := time.Now().Add(-ser.Retention)
+	cutoff := nowFunc().Add(-ser.Retention)
 	return s.db.WithContext(ctx).
 		Where("series_id = ? AND time < ?", ser.ID, unixMilli(cutoff)).
 		Delete(&dbRecord{}).Error

@@ -3,6 +3,7 @@ package timeseries
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"gorm.io/gorm"
@@ -22,15 +23,86 @@ type dbRecord struct {
 func (dbRecord) TableName() string { return "records" }
 
 // Point is one timestamp with a set of named field values.
+//
+// Time must be in time.UTC: the library stores and returns UTC and performs no
+// zone conversion, so a non-UTC Time is rejected rather than silently converted.
+// Time is stored at millisecond resolution — sub-millisecond components are
+// truncated, so two instants within the same millisecond resolve to the same
+// stored key (a later write overwrites the earlier). Values must be non-empty
+// and every value finite (NaN and ±Inf are rejected).
 type Point struct {
 	Time   time.Time
 	Values map[string]float64
+}
+
+// recordKey identifies a stored row within a write batch by its millisecond
+// timestamp and field id — used to reject duplicate (time, field) keys before
+// insert, since the upsert target is that composite key.
+type recordKey struct {
+	ms  int64
+	fid uint
+}
+
+// ensureUTC rejects a non-UTC time. The zero time is exempt: it is the unbounded
+// sentinel for range bounds (and the write path rejects zero separately).
+func ensureUTC(t time.Time) error {
+	if t.IsZero() {
+		return nil
+	}
+	if t.Location() != time.UTC {
+		return fmt.Errorf("time must be UTC, got location %q", t.Location())
+	}
+	return nil
 }
 
 // Sample is a single (time, value) pair for one field.
 type Sample struct {
 	Time  time.Time
 	Value float64
+}
+
+// Coverage reports how much of a series' defined field set a multi-field snapshot
+// resolved. It is returned by At and Latest. Single-field reads (FieldAt,
+// LatestField) report presence with a bool instead, since coverage there is
+// all-or-nothing.
+type Coverage int
+
+const (
+	// CoverageNone means no defined field resolved: the result Point is empty
+	// (the series has no records at or before the query time).
+	CoverageNone Coverage = iota
+	// CoveragePartial means some, but not all, defined fields resolved — so the
+	// Point is missing one or more fields (e.g. a field added after the queried
+	// time, or fields with divergent histories).
+	CoveragePartial
+	// CoverageFull means every defined field resolved.
+	CoverageFull
+)
+
+func (c Coverage) String() string {
+	switch c {
+	case CoverageNone:
+		return "none"
+	case CoveragePartial:
+		return "partial"
+	case CoverageFull:
+		return "full"
+	default:
+		return fmt.Sprintf("Coverage(%d)", int(c))
+	}
+}
+
+// coverage classifies a snapshot by how many of the series' defined fields (total)
+// resolved (got): 0 is None, all is Full, anything between is Partial.
+func coverage(got, total int) Coverage {
+	switch {
+	case got == 0:
+		return CoverageNone
+	case got >= total:
+		return CoverageFull
+	default:
+		return CoveragePartial
+	}
 }
 
 // Write upserts one multi-field point.
@@ -54,14 +126,27 @@ func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error 
 		return err
 	}
 
-	// Resolve field names to ids once (cache across all points).
+	// Resolve field names to ids once (cache across all points). seen tracks the
+	// composite upsert key per batch so a duplicate (time, field) is rejected
+	// here rather than relying on dialect-specific upsert behavior.
 	fieldIDs := map[string]uint{}
+	seen := map[recordKey]bool{}
 	var rows []dbRecord
 	for i, p := range ps {
 		if p.Time.IsZero() {
 			return fmt.Errorf("point %d: time cannot be zero", i)
 		}
+		if err := ensureUTC(p.Time); err != nil {
+			return fmt.Errorf("point %d: %w", i, err)
+		}
+		if len(p.Values) == 0 {
+			return fmt.Errorf("point %d: no values", i)
+		}
+		ms := p.Time.UTC().UnixMilli() // matches the stored millisecond key
 		for name, val := range p.Values {
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				return fmt.Errorf("point %d field %q: value must be finite, got %v", i, name, val)
+			}
 			fid, ok := fieldIDs[name]
 			if !ok {
 				fid, err = s.fieldID(ctx, sid, name)
@@ -70,6 +155,11 @@ func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error 
 				}
 				fieldIDs[name] = fid
 			}
+			k := recordKey{ms: ms, fid: fid}
+			if seen[k] {
+				return fmt.Errorf("point %d field %q: duplicate (time, field) in batch", i, name)
+			}
+			seen[k] = true
 			rows = append(rows, dbRecord{
 				SeriesID: sid,
 				FieldID:  fid,
@@ -98,6 +188,12 @@ func (s *Store) WriteMany(ctx context.Context, series string, ps []Point) error 
 func (s *Store) Range(ctx context.Context, series string, start, end time.Time) ([]Point, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(start); err != nil {
+		return nil, err
+	}
+	if err := ensureUTC(end); err != nil {
+		return nil, err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return nil, err
@@ -137,6 +233,12 @@ func (s *Store) Range(ctx context.Context, series string, start, end time.Time) 
 func (s *Store) FieldRange(ctx context.Context, series, field string, start, end time.Time) ([]Sample, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(start); err != nil {
+		return nil, err
+	}
+	if err := ensureUTC(end); err != nil {
+		return nil, err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return nil, err
@@ -167,6 +269,9 @@ func (s *Store) FieldRange(ctx context.Context, series, field string, start, end
 func (s *Store) FieldAt(ctx context.Context, series, field string, t time.Time) (float64, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(t); err != nil {
+		return 0, false, err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return 0, false, err
@@ -189,24 +294,27 @@ func (s *Store) FieldAt(ctx context.Context, series, field string, t time.Time) 
 
 // At returns an as-of snapshot: each field's latest value at or before t.
 // The returned Point.Time is the query time t; per-field source timestamps are
-// not kept. found is false when no field has any sample at or before t; an
-// unknown series returns ErrSeriesNotFound (mirroring Latest/FieldAt).
+// not kept. An unknown series returns ErrSeriesNotFound (mirroring Latest/FieldAt).
 //
 // The snapshot is best-effort per field: each field resolves to its own latest
-// value <= t independently, so a Point may be partial (some fields present,
-// others absent) when fields have divergent histories. found=true means at
-// least one field resolved, not that every field did — callers that require a
-// complete record must check the field set themselves.
-func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, bool, error) {
+// value <= t independently, so a Point may be partial when fields have divergent
+// histories. The returned Coverage reports this: CoverageNone (no field resolved,
+// empty Point), CoveragePartial (some defined fields missing), or CoverageFull
+// (every defined field present). Callers that require a complete record reject
+// anything but CoverageFull instead of re-deriving the field set themselves.
+func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, Coverage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(t); err != nil {
+		return Point{}, CoverageNone, err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 	names, err := s.fieldNames(ctx, sid)
 	if err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 
 	// Portable "latest per field <= t": match rows whose time equals the per-field max <= t.
@@ -223,33 +331,38 @@ func (s *Store) At(ctx context.Context, series string, t time.Time) (Point, bool
 		  )
 	`, tbl), sid, unixMilli(t), unixMilli(t)).Scan(&recs).Error
 	if err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 	if len(recs) == 0 {
-		return Point{}, false, nil
+		return Point{}, CoverageNone, nil
 	}
 
 	out := Point{Time: t, Values: map[string]float64{}}
 	for _, r := range recs {
 		out.Values[names[r.FieldID]] = r.Value
 	}
-	return out, true, nil
+	return out, coverage(len(out.Values), len(names)), nil
 }
 
 // Latest returns the point at the series' most recent timestamp, with its real
-// time preserved (unlike At, which stamps the query time). found is false when
-// the series exists but holds no records. An unknown series returns
-// ErrSeriesNotFound. Reads only the newest timestamp's rows, not the whole series.
-func (s *Store) Latest(ctx context.Context, series string) (Point, bool, error) {
+// time preserved (unlike At, which stamps the query time). An unknown series
+// returns ErrSeriesNotFound. Reads only the newest timestamp's rows, not the
+// whole series.
+//
+// The returned Coverage describes the snapshot: CoverageNone when the series
+// holds no records (empty Point), CoveragePartial when the newest timestamp
+// carries only some of the defined fields (fields whose own latest write is
+// older do not appear), or CoverageFull when every defined field is present.
+func (s *Store) Latest(ctx context.Context, series string) (Point, Coverage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 	names, err := s.fieldNames(ctx, sid)
 	if err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 
 	// Every field at the series' newest timestamp, read as one consistent snapshot:
@@ -262,16 +375,16 @@ func (s *Store) Latest(ctx context.Context, series string) (Point, bool, error) 
 	var recs []dbRecord
 	if err := s.db.WithContext(ctx).Where("series_id = ? AND time = (?)", sid, newest).
 		Order("field_id ASC").Find(&recs).Error; err != nil {
-		return Point{}, false, err
+		return Point{}, CoverageNone, err
 	}
 	if len(recs) == 0 {
-		return Point{}, false, nil
+		return Point{}, CoverageNone, nil
 	}
 	out := Point{Time: recs[0].Time.asTime(), Values: map[string]float64{}}
 	for _, r := range recs {
 		out.Values[names[r.FieldID]] = r.Value
 	}
-	return out, true, nil
+	return out, coverage(len(out.Values), len(names)), nil
 }
 
 // LatestField returns the newest (time, value) for one field. found is false
@@ -388,6 +501,9 @@ func (s *Store) CountAll(ctx context.Context, opts ...ListOption) (map[string]in
 func (s *Store) Delete(ctx context.Context, series string, t time.Time) (deleted bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(t); err != nil {
+		return false, err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return false, err
@@ -404,6 +520,12 @@ func (s *Store) Delete(ctx context.Context, series string, t time.Time) (deleted
 func (s *Store) DeleteRange(ctx context.Context, series string, start, end time.Time) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ensureUTC(start); err != nil {
+		return err
+	}
+	if err := ensureUTC(end); err != nil {
+		return err
+	}
 	sid, err := s.seriesID(ctx, series)
 	if err != nil {
 		return err
